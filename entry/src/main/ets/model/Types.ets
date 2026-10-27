@@ -78,6 +78,8 @@ export interface DetailInfo {
   director?: string;
   actor?: string;
   remarks?: string;
+  /** 源站评分（CMS 的 vod_score），可能是 '0.0' / ''，由详情页判断是否可用 */
+  score?: string;
   sourceKey: string;
   sourceName: string;
   sourceUrl: string;

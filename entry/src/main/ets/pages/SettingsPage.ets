@@ -270,6 +270,7 @@ export struct SettingsPage {
               Image($r('app.media.ic_back'))
                 .width(20)
                 .height(20)
+                .fillColor($r('app.color.color_text'))
             }
             .width(36)
             .height(40)
@@ -299,7 +300,7 @@ export struct SettingsPage {
   @Builder
   optionPanel(name: string, items: OptionItem[], currentKey: string) {
     Column({ space: 8 }) {
-      ForEach(items, (item: OptionItem) => {
+      ForEach(items, (item: OptionItem, index: number) => {
         Row({ space: 8 }) {
           Text(item.label)
             .fontSize(14)

@@ -10,7 +10,8 @@ import { SourceManager } from '../data/SourceManager';
 import { SettingsStore } from '../data/SettingsStore';
 import { DownloadManager } from '../data/DownloadManager';
 import { EventBus, Events } from '../common/EventBus';
-import { DoubanClient } from '../model/DoubanClient';
+import { DoubanClient, SuggestItem } from '../model/DoubanClient';
+import { SuggestEngine, SuggestSink } from '../model/SuggestEngine';
 import { BangumiClient } from '../model/BangumiClient';
 import { HttpClient } from '../net/HttpClient';
 import { M3uParser } from '../model/M3uParser';
@@ -41,6 +42,8 @@ import { SystemInsets } from '../common/SystemInsets';
 import { BlurFade } from '../common/BlurFade';
 import { DeepLink, ShareLink, ShareTarget } from '../common/ShareLink';
 import { SearchService } from '../model/SearchService';
+import { ArrayDataSource } from '../common/ArrayDataSource';
+
 
 @Observed
 class LiveGroupState {
@@ -163,12 +166,57 @@ const LIVE_EXPAND_TAIL: number = 84;
  */
 const LIVE_EXPAND_BOTTOM: number = 76;
 
+/**
+ * 直播源卡片的尺寸（vp）。照参考图：收起时每张卡只露出标题条，
+ * 下一张压住上一张一截，叠成一摞纸；展开才长成整块。
+ */
+const LIVE_HEADER_H: number = 58;
+/** 收起态卡片总高：比标题条高，最下面那张不会被压住，看得出是「一叠」 */
+const LIVE_CARD_H: number = 96;
+/** 收起时下一张压住上一张多少 —— 这个重叠就是立体叠卡的来源 */
+const LIVE_STACK_OVERLAP: number = 46;
+/** 相邻两张卡展开时的间距 */
+const LIVE_CARD_GAP: number = 10;
+/**
+ * 频道列表最多铺多少行。
+ * 有的源 1000+ 个频道，一次性把几百行（每行一个 NetImage）挂到树上，
+ * 展开那一下要卡将近 1 秒 —— 所以按「先铺一屏，滚到再补」的方式分页渲染。
+ */
+const LIVE_MAX_ROWS: number = 300;
+/** 展开时先铺出来的行数：一屏多，够把「卡片长出来」的动画撑住 */
+const LIVE_FIRST_ROWS: number = 24;
+/** 滑到底部再补多少行 */
+const LIVE_MORE_ROWS: number = 48;
+/**
+ * 卡片配色套数：淡紫 / 青柠 / 石墨 / 杏橙 / 钢蓝 / 玫瑰 / 薄荷（按源顺序循环）。
+ *
+ * 色值本身不在这里 —— 放在 resources/base|dark/element/color.json 的
+ * color_live_card_1..7 里，深浅主题各存一份。原因：
+ * EntryAbility 里设了 setColorMode(COLOR_MODE_NOT_SET)，之后 config.colorMode
+ * 返回 NOT_SET，靠运行时判断主题会误判；只有资源限定目录（dark）是可靠的。
+ * 浅色主题：那摞淡彩色卡，叠在一起层次最清楚；
+ * 深色主题：同样的七个色相压成低饱和暗彩，比页面底 #191922 亮一档但不刺眼。
+ */
+const LIVE_CARD_PALETTE: number = 7;
+
 @Entry
 @Component
 struct IndexPage {
   private navStack: NavPathStack = new NavPathStack();
   /** 推荐翻页起点：豆瓣按 page_start 分页，固定传 0 就会永远返回同一批「换一换」内容 */
   private recPageStart: number = 0;
+
+  /**
+   * 联想引擎：防抖 / 序号作废 / 本地兜底 / 两段式补全都在里面，
+   * 搜索结果页复用同一个类，两边的行为不会走样。
+   */
+  private suggestEngine: SuggestEngine = new SuggestEngine();
+  /**
+   * 程序化回填的输入值。
+   * `$$` 双向绑定在代码赋值时会回抛一次**等值** onChange；把它记下来，
+   * 等那次 onChange 到了就认出来「这不是用户在打字」，不再触发联想。
+   */
+  private quietValue: string = '';
   /** 历史封面回填是否已跑过，避免每次刷新重复请求 */
   private backfillStarted: boolean = false;
   private historyCb: () => void = () => {};
@@ -177,17 +225,38 @@ struct IndexPage {
   private liveFavCb: () => void = () => {};
 
   @State activeTab: number = 0;
+
+  // ---------- 底部导航的白色流光 ----------
   /**
-   * 导航胶囊的「光追」反馈：记录光斑落在哪个 tab 上，以及光的扩散进度。
-   * 三个字段都必须同步驱动同一个 tabItem 的 opacity / scale，
-   * 否则动画只改透明度、看起来像「闪一下」而不是「从图标中心扩出去」。
+   * 光带（主体）当前停在哪一颗。
+   *
+   * 初始值刻意给 1（中间那颗「直播」）—— 用户第一次点两侧的按钮时，
+   * 光是从中间移过去的，而不是「凭空出现在要点的位置上」。
+   * 但首帧并不点亮它（navGlowAlpha 为 0），否则一进 APP 就有一团白光
+   * 停在没被选中的「直播」上，看起来像个 bug。
    */
-  @State navGlowTab: number = -1;
+  @State navGlowIndex: number = 1;
+  /** 拖尾层的目标位置：比主体慢半拍，移动过程里才看得出「光流过去」 */
+  @State navGlowLag: number = 1;
+  /** 光带整体亮度：0 = 还没点亮过；第一次点击后升到 NAV_GLOW_ALPHA */
   @State navGlowAlpha: number = 0;
-  @State navGlowScale: number = 0.5;
+  /** 手指正按住的项（-1 = 没按）：按下时那一颗自己亮一圈，抬起立刻熄 */
+  @State navPressIndex: number = -1;
+  /** 胶囊内导航排的实测宽度（vp）：算三项中心点用，旋转/分屏都会变，必须实测 */
+  @State navRowW: number = 0;
+
+  // ---------- 首页搜索联想 ----------
   @State searchValue: string = '';
+  /** 联想候选：最多 6 条，够一屏看，再多面板就要盖住半屏内容 */
+  @State suggestItems: SuggestItem[] = [];
+  /** 联想请求在飞：面板里先显示一行「正在联想」 */
+  @State suggestLoading: boolean = false;
+  /** 面板是否展开：只在「有输入」时展开，清空输入立即收起 */
+  @State suggestOpen: boolean = false;
   @State homeHistory: PlayRecord[] = [];
   @State recommendItems: RecommendItem[] = [];
+  /** LazyForEach 数据源：与 recommendItems 同步，避免一次性创建全部卡片 */
+  private recDataSource: ArrayDataSource = new ArrayDataSource();
   @State recommendLoading: boolean = false;
   /**
    * 分类切换 / 换一换期间的轻量提示开关。
@@ -631,6 +700,7 @@ struct IndexPage {
         // 整体重排会让用户觉得界面自己跳了一下。
         const merged: RecommendItem[] = this.mergeItems(this.recommendItems, this.orderItems(items));
         this.recommendItems = merged;
+        this.recDataSource.setData(merged);
         if (items.length === 0) {
           this.recHasMore = false;
         } else {
@@ -643,6 +713,7 @@ struct IndexPage {
         }
       } else {
         this.recommendItems = this.orderItems(items);
+        this.recDataSource.setData(this.recommendItems);
         if (!fallback) {
           // 记成「已取到的最后一页起点」，append 时从它的下一页开始
           this.recPageStart = start + (fetchedPages - 1) * pageSize;
@@ -918,17 +989,21 @@ struct IndexPage {
     const groups: LiveGroupState[] = [];
     for (const s of sources) {
       const existing = this.findGroup(s.key);
+      if (existing !== null) {
+        // 必须原地复用同一个实例。
+        // ForEach 的 key 稳定（只有 sourceKey）时不会重新生成子项，子组件捕获的
+        // group 引用就固定在第一次渲染的那个对象上；这里若换成 new 出来的新对象，
+        // 外部拿到的状态变了，卡片内部却永远读不到 expanded，
+        // 表现就是「点一下没反应、展不开频道」。
+        existing.sourceName = s.name;
+        existing.epgUrl = s.epg !== undefined ? s.epg : '';
+        groups.push(existing);
+        continue;
+      }
       const g: LiveGroupState = new LiveGroupState();
       g.sourceKey = s.key;
       g.sourceName = s.name;
       g.epgUrl = s.epg !== undefined ? s.epg : '';
-      g.channels = existing !== null ? existing.channels : [];
-      g.expanded = existing !== null ? existing.expanded : false;
-      g.loaded = existing !== null ? existing.loaded : false;
-      g.epgProgrammes = existing !== null ? existing.epgProgrammes : [];
-      g.epgChannelIds = existing !== null ? existing.epgChannelIds : new Map<string, string>();
-      g.epgLoaded = existing !== null ? existing.epgLoaded : false;
-      g.epgTextMap = existing !== null ? existing.epgTextMap : new Map<string, string>();
       groups.push(g);
     }
     this.liveGroups = groups;
@@ -980,7 +1055,74 @@ struct IndexPage {
       this.toast('请输入搜索关键词');
       return;
     }
+    this.closeSuggest();
     const p: SearchPageParam = { keyword: wd };
+    this.navStack.pushPath({ name: 'Search', param: p });
+  }
+
+  // ---------- 搜索联想 ----------
+
+  /**
+   * 输入变化 -> 联想。
+   *
+   * 这里只负责「开/关面板」和把引擎的出口接上去，
+   * 防抖、作废、两段式补全都交给 SuggestEngine（搜索结果页共用同一套）。
+   */
+  /** 程序化回填输入框：记下值，等那次等值 onChange 到来时忽略它 */
+  private setSearchQuiet(v: string): void {
+    this.quietValue = v;
+    this.searchValue = v;
+  }
+
+  private onSearchInput(value: string): void {
+    // 回填的回声：值没变，说明不是用户输入 —— 吞掉。
+    // 不吞的话，首页点候选跳转后，回写输入框会把联想面板重新撑开。
+    if (value === this.quietValue) {
+      this.quietValue = '';
+      return;
+    }
+    this.quietValue = '';
+    this.suggestOpen = value.trim() !== '';
+    this.suggestEngine.setPool(this.suggestPool());
+    this.suggestEngine.input(value, this.suggestSink());
+  }
+
+  /** 引擎出口 -> 页面 @State（对象每次新建，闭包里的 this 指向本页面） */
+  private suggestSink(): SuggestSink {
+    return {
+      onUpdate: (items: SuggestItem[], loading: boolean): void => {
+        this.suggestItems = items;
+        this.suggestLoading = loading;
+      },
+      onClose: (): void => {
+        this.suggestItems = [];
+        this.suggestLoading = false;
+        this.suggestOpen = false;
+      }
+    };
+  }
+
+  /** 本地兜底池：首页已加载的推荐片名 + 播放历史 */
+  private suggestPool(): string[] {
+    const pool: string[] = [];
+    for (const it of this.recommendItems) {
+      pool.push(it.title);
+    }
+    for (const rec of this.homeHistory) {
+      pool.push(rec.name);
+    }
+    return pool;
+  }
+
+  private closeSuggest(): void {
+    this.suggestEngine.close(this.suggestSink());
+  }
+
+  /** 点中一条候选：回填输入框，直接走搜索（用户要的是片子，不是豆瓣条目页） */
+  private pickSuggest(item: SuggestItem): void {
+    this.setSearchQuiet(item.title);
+    this.closeSuggest();
+    const p: SearchPageParam = { keyword: item.title };
     this.navStack.pushPath({ name: 'Search', param: p });
   }
 
@@ -1029,23 +1171,16 @@ struct IndexPage {
     return pct + '%';
   }
 
-  /**
-   * 直播分组项的 ForEach key。
-   * 只用 sourceKey 作 key 时，展开/加载等内部字段变化不会让 ForEach 重建该项，
-   * UI 永远停在初始状态 —— 表现为「点直播源毫无反应」。
-   * 把影响展示的状态拼进 key，任一状态变化即触发重建。
-   */
-  private liveGroupKey(group: LiveGroupState): string {
-    return group.sourceKey + '|' + (group.expanded ? '1' : '0') + '|' + (group.loaded ? '1' : '0')
-      + '|' + (group.loading ? '1' : '0') + '|' + group.channels.length + '|' + group.error;
-  }
-
   private toggleLiveGroup(key: string): void {
     for (let i = 0; i < this.liveGroups.length; i++) {
       if (this.liveGroups[i].sourceKey === key) {
         const expanded = !this.liveGroups[i].expanded;
-        this.liveGroups[i].expanded = expanded;
-        this.liveGroups = this.liveGroups.slice();
+        // 放在 animateTo 里：卡片高度从「一条标题」长成整页频道，
+        // 下面的卡跟着平滑下移（收起时上移），而不是瞬间跳。
+        this.getUIContext().animateTo({ duration: 320, curve: Curve.FastOutSlowIn }, () => {
+          this.liveGroups[i].expanded = expanded;
+          this.liveGroups = this.liveGroups.slice();
+        });
         if (expanded && !this.liveGroups[i].loaded && !this.liveGroups[i].loading) {
           this.loadLiveGroup(key);
         }
@@ -1077,33 +1212,26 @@ struct IndexPage {
     return (group.expanded && group.channels.length > LIVE_COLLAPSE_ROWS) ? LIVE_EXPAND_TAIL : 0;
   }
 
-  /** 收起所有「长频道」分组，并把列表滚回第一个被收起源的分组标题 */
-  private collapseLongGroups(): void {
-    let target: string = '';
-    let changed: boolean = false;
-    for (const g of this.liveGroups) {
-      if (g.expanded && g.channels.length > LIVE_COLLAPSE_ROWS) {
-        g.expanded = false;
-        changed = true;
-        if (target === '') {
-          target = g.sourceKey;
-        }
+  /**
+   * 收起所有展开着的源卡（浮层「收起频道」用）。
+   * 高度变化放在 animateTo 里，下面的卡跟着平滑上移。
+   */
+  private collapseAllGroups(): void {
+    let any: boolean = false;
+    for (let i = 0; i < this.liveGroups.length; i++) {
+      if (this.liveGroups[i].expanded) {
+        any = true;
       }
     }
-    if (!changed) {
+    if (!any) {
       return;
     }
-    this.liveGroups = this.liveGroups.slice();
-    // 收起后每项高度骤降，必须等这一帧布局生效再滚，
-    // 立刻调 scrollToIndex 会按旧布局算偏移量，落点会偏。
-    setTimeout(() => {
+    this.getUIContext().animateTo({ duration: 320, curve: Curve.FastOutSlowIn }, () => {
       for (let i = 0; i < this.liveGroups.length; i++) {
-        if (this.liveGroups[i].sourceKey === target) {
-          this.liveScroller.scrollToIndex(i, true, ScrollAlign.START);
-          break;
-        }
+        this.liveGroups[i].expanded = false;
       }
-    }, 80);
+      this.liveGroups = this.liveGroups.slice();
+    });
   }
 
   private async loadLiveGroup(key: string): Promise<void> {
@@ -1190,13 +1318,6 @@ struct IndexPage {
     return text;
   }
 
-  private arrowAngle(group: LiveGroupState): number {
-    if (group.expanded) {
-      return 270;
-    }
-    return 180;
-  }
-
   private openLive(group: LiveGroupState, ch: LiveChannel): void {
     const p: LivePlayerPageParam = {
       channelUrl: ch.url,
@@ -1235,12 +1356,19 @@ struct IndexPage {
     this.navStack.pushPath({ name: 'About' });
   }
 
-  /** 页面背景渐变。色值走资源，深浅主题自动跟随 */
+  /**
+   * 页面背景。
+   *
+   * 曾经是「顶部淡蓝 → 中段底色 → 底部淡青」的三段竖向渐变 + 两团彩色光斑。
+   * 在平板上必然翻车：深色主题两端差 21 级色阶，8bit 输出就是 21 条横向色带；
+   * 中段 color_bg 又比顶部更暗，剖面变成「亮→暗→亮」，看着像两块底色拼接。
+   * 渐变本身是矢量的、没有分辨率概念，加色标也不会让色带变细 —— 只能压平。
+   * 所以这里改成纯色，层次交给内容卡片与玻璃条。
+   */
   private pageBgGradient(): LinearGradientOptions {
     const colors: Array<[ResourceColor, number]> = [
-      [$r('app.color.color_bg_top'), 0],
-      [$r('app.color.color_bg'), 0.52],
-      [$r('app.color.color_bg_bottom'), 1]
+      [$r('app.color.color_page_bg'), 0],
+      [$r('app.color.color_page_bg'), 1]
     ];
     const opt: LinearGradientOptions = {
       direction: GradientDirection.Bottom,
@@ -1249,48 +1377,19 @@ struct IndexPage {
     return opt;
   }
 
-  /** 环境光斑：纯色从中心渐隐到全透明 */
-  private blobGradient(color: ResourceColor, radius: number): RadialGradientOptions {
-    const colors: Array<[ResourceColor, number]> = [
-      [color, 0],
-      [color, 0.38],
-      ['#00FFFFFF', 1]
-    ];
-    const opt: RadialGradientOptions = {
-      center: [radius, radius],
-      radius: radius,
-      colors: colors
-    };
-    return opt;
-  }
-
   build() {
     Navigation(this.navStack) {
       Stack({ alignContent: Alignment.TopStart }) {
-        // 背景铺满全屏（含状态栏与底部导航条）
-        // 渐变底：沉浸光感的"通透"需要有东西可透 —— 纯色底上的玻璃只是一块灰板。
-        // 从顶部淡蓝、中段回到页面底色、底部转淡青，配合下面两团光斑形成"空间里有一束光"。
+        // 背景铺满全屏（含状态栏与底部导航条）。
+        // 纯色而非渐变：整屏渐变在 8bit 输出上必有横向色带，平板尤其明显。
+        // 两团「环境光斑」也已删除 —— 它们从彩色淡到 #00FFFFFF 时 RGB 会被
+        // 一起插值到白，在深色底上留下一圈发白的粉环，也就是用户看到的
+        // 「红色圆圈」。要淡出必须同 RGB 只把 alpha 置 0（见 BlurFade 的注释）。
         Column()
           .width('100%')
           .height('100%')
           .linearGradient(this.pageBgGradient())
           .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-
-        // 环境光斑：左上偏冷、右中偏暖。用径向渐变本身做柔边，
-        // 不额外加 blur —— 大面积的 blur 会多一层离屏渲染，长列表上很划不来。
-        Column()
-          .width(300)
-          .height(300)
-          .radialGradient(this.blobGradient($r('app.color.color_blob_cool'), 150))
-          .position({ x: -110, y: -150 })
-          .hitTestBehavior(HitTestMode.None)
-
-        Column()
-          .width(260)
-          .height(260)
-          .radialGradient(this.blobGradient($r('app.color.color_blob_warm'), 130))
-          .position({ x: 210, y: 600 })
-          .hitTestBehavior(HitTestMode.None)
 
         Column({ space: 0 }) {
         // Tabs 保留原生 tabBar。
@@ -1387,13 +1486,24 @@ struct IndexPage {
               .onSubmit((value: string) => {
                 this.onSearchSubmit();
               })
+              // 输入即联想：一个字就出候选（见 onSearchInput 里的分级防抖）
+              .onChange((value: string) => {
+                this.onSearchInput(value);
+              })
           }
           .width('100%')
           // Row 必须显式给高度：不给的话，外层 Column 被 expandSafeArea 撑到
           // 整个安全区那么高，Row 作为唯一子节点跟着被撑满，搜索胶囊在 Row 里
           // 垂直居中 —— 结果胶囊离状态栏空出 20vp，看着像"没贴上去"。
-          .height(this.wide() ? 44 : 40)
-          // top 归零：搜索栏直接贴着安全区底边。
+          // 高度必须**等于内容总高**：`padding.top + 胶囊 + 6`。
+          // 踩过的两个坑都在这两个值上，别再动：
+          //   ① padding.top 必须是 SystemInsets.top() —— 这一层是**唯一**给状态栏
+          //      让位的地方，改小（试过 8vp）搜索胶囊就直接顶进状态栏；
+          //   ② height 写死 40vp 时，padding(38) + 胶囊(36) + 6 已经超过盒高，
+          //      ArkUI 会把 padding 悄悄截断，盒子只剩 21px；联想面板按盒子底边
+          //      往下排、不参与截断，于是整块上移压在胶囊上。
+          // 现在盒子正好等于内容总高，底边落在「胶囊底边 + 6vp」，面板自然贴下方。
+          .height(SystemInsets.top() + (this.wide() ? 44 : 36) + 6)
           .padding({
             left: this.wide() ? 16 : 12,
             right: this.wide() ? 16 : 12,
@@ -1402,6 +1512,13 @@ struct IndexPage {
             bottom: this.wide() ? 6 : 6
           })
           .alignItems(VerticalAlign.Top)
+
+          // 联想面板：和搜索胶囊同宽、同左右内收，紧贴它下沿。
+          // 它挂在顶部浮层这个 Column 里，而浮层本身压在 Tabs 内容之上，
+          // 所以面板天然盖住首屏内容，不需要额外做定位或层级。
+          if (this.suggestOpen && (this.suggestItems.length > 0 || this.suggestLoading)) {
+            this.suggestPanel()
+          }
         }
         .width('100%')
         // 这一层刻意「不铺底」。
@@ -1419,8 +1536,10 @@ struct IndexPage {
         // 底部安全区过渡罩（手势条那一条）：与顶部同一套做法，
         // 内容从它背后滚过时被虚化。放在胶囊之前，胶囊才浮在它上面。
         Stack({ alignContent: Alignment.Bottom }) {
-          // 底部底色是暖色（color_bg_bottom #E6E7E2 / 深色 #2E2723），
-          // 罩子必须跟着换，否则冷色罩压在暖底上就是一条「色差带」。
+          // 页面底色在压平渐变时已统一成纯色 color_page_bg（浅 #DCE3F1 / 深 #191922），
+          // 所以底部罩子必须用**同一个 RGB**，只让 alpha 从 0 走到近不透明；
+          // 用别的颜色（哪怕只差一点暖度）都会在胶囊周围留出一条看得见的色差带——
+          // 浅色主题下最明显，因为罩子的 alpha 底色与页面底是两块可比的浅色。
           BlurFade({
             edge: 'bottom',
             band: SystemInsets.bottom() + 68,
@@ -1547,6 +1666,78 @@ struct IndexPage {
   }
 
   /**
+   * 搜索联想面板。
+   *
+   * 只用玻璃色 + 细描边，不加不透明底：背后是滚动中的海报墙，
+   * 磨开一点才像「从搜索栏里掉出来的一层」，而不是贴了张白纸。
+   * 高度由行数撑，最多 6 行（200vp 出头），不会把首屏盖死。
+   */
+  @Builder
+  suggestPanel() {
+    Column() {
+      Column() {
+        if (this.suggestItems.length === 0) {
+          Row({ space: 8 }) {
+            LoadingProgress()
+              .width(16)
+              .height(16)
+              .color($r('app.color.color_text_secondary'))
+            Text('正在联想片名…')
+              .fontSize(13)
+              .fontColor($r('app.color.color_text_secondary'))
+          }
+          .width('100%')
+          .height(44)
+          .padding({ left: 14, right: 14 })
+          .alignItems(VerticalAlign.Center)
+        } else {
+          ForEach(this.suggestItems, (item: SuggestItem) => {
+            Row({ space: 8 }) {
+              Text(item.title)
+                .fontSize(14)
+                .fontColor($r('app.color.color_text'))
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .layoutWeight(1)
+              if (item.year !== '') {
+                Text(item.year)
+                  .fontSize(11)
+                  .fontColor($r('app.color.color_text_secondary'))
+                  .maxLines(1)
+              }
+              Text(item.kind)
+                .fontSize(10)
+                .fontColor($r('app.color.color_text_secondary'))
+                .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+                .borderRadius(6)
+                .backgroundColor($r('app.color.color_caption_glass'))
+            }
+            .width('100%')
+            .height(42)
+            .padding({ left: 14, right: 14 })
+            .alignItems(VerticalAlign.Center)
+            .onClick(() => {
+              this.pickSuggest(item);
+            })
+          }, (item: SuggestItem) => item.title + '|' + item.year + '|' + item.kind)
+        }
+      }
+      .width('100%')
+      .padding({ top: 4, bottom: 4 })
+      .backgroundColor($r('app.color.color_panel_glass'))
+      .backgroundEffect({ radius: 18, saturation: 1.6 })
+      .borderRadius(16)
+      .border({ width: 1, color: $r('app.color.color_nav_border') })
+      .shadow({ radius: 18, color: $r('app.color.color_glass_shadow'), offsetY: 6 })
+    }
+    .width('100%')
+    // 与搜索胶囊同左右内收，视觉上才能对齐成一条竖线。
+    // top 留 0：上一行 Row 的 bottom padding 已经把面板推到胶囊下方 6vp，
+    // 这里再加一份就会变成 12vp，面板看着离搜索框"飘"起来了。
+    .padding({ left: this.wide() ? 16 : 12, right: this.wide() ? 16 : 12, top: 0 })
+  }
+
+  /**
    * 底部导航胶囊（浮层）。
    *
    * 位置：容器铺满整页、靠 justifyContent(FlexAlign.End) 把胶囊压到容器底边，
@@ -1587,6 +1778,57 @@ struct IndexPage {
             // 与顶部搜索栏同档：radius 18 / saturation 1.6
             .backgroundEffect({ radius: 18, saturation: 1.6 })
 
+          // ---------- 白色流光（整条移动，不是每颗各亮各的）----------
+          // 两层都要**在图标之下**：光只负责照亮「这一格」，片子名得始终读得清。
+          //
+          // 为什么是「一层 + translate」而不是「三颗各挂一团」：
+          // 各挂一团的写法只能原地扩散/淡出，看起来是三次独立的闪光；
+          // 只有同一团光在舱内平移，才是用户说的「从上一次点的按钮移到这一次」。
+          // 位移 = 项宽 ×（index - 1），项宽由下面的 onAreaChange 实测得到。
+          //
+          // 拖尾层：更宽、更淡、慢 180ms 到 —— 移动过程里它是主体的「尾巴」，
+          // 停稳之后两层重合，看上去就只是被照亮的一格。
+          //
+          // 渐变必须是**实心光斑**（中心亮 -> 向外淡出）。
+          // 早先写成 `0 -> 8% -> 0` 的环形，在浅色底上就是一圈椭圆描边，
+          // 和下面那层 shadow 叠在一起正好是用户看到的「椭圆形边沿」。
+          Column()
+            .width(150)
+            .height(48)
+            .borderRadius(24)
+            .radialGradient({
+              center: ['50%', '50%'],
+              radius: 75,
+              colors: [
+                [$r('app.color.color_nav_glow_soft'), 0],
+                [$r('app.color.color_nav_glow_clear'), 1]
+              ]
+            })
+            .opacity(this.navGlowAlpha)
+            .translate({ x: (this.navGlowLag - 1) * this.navCellW() })
+
+          // 主体层：96×52 的一团白光，中心也不给高不透明度
+          // （给到 0.5 以上，深色主题下白字会糊在白底上读不出来）。
+          //
+          // **不要加 .shadow / 描边**：浅色主题下白光照不亮浅灰胶囊，
+          // 能看见的只有那圈阴影 —— 就是「多出来的椭圆形边沿」。
+          // 光晕颜色走资源：深色 = 白光，浅色 = 全透明（浅色下干脆不画）。
+          Column()
+            .width(96)
+            .height(52)
+            .borderRadius(26)
+            .radialGradient({
+              center: ['50%', '50%'],
+              radius: 48,
+              colors: [
+                [$r('app.color.color_nav_glow_core'), 0],
+                [$r('app.color.color_nav_glow_mid'), 0.45],
+                [$r('app.color.color_nav_glow_clear'), 1]
+              ]
+            })
+            .opacity(this.navGlowAlpha)
+            .translate({ x: (this.navGlowIndex - 1) * this.navCellW() })
+
           Row() {
             this.navItem($r('app.media.ic_home'), '首页', 0)
             this.navItem($r('app.media.ic_nav_live'), '直播', 1)
@@ -1594,6 +1836,14 @@ struct IndexPage {
           }
           .width('100%')
           .height('100%')
+          // 量宽度：三项是 layoutWeight(1) 三等分，项宽 =（宽度 - 左右各 12）/ 3。
+          // 不能写死：手机/平板/横屏三态差得远，写死那条流光会跑到格子外。
+          .onAreaChange((oldArea: Area, newArea: Area) => {
+            const w: number = newArea.width as number;
+            if (Math.abs(w - this.navRowW) > 0.5) {
+              this.navRowW = w;
+            }
+          })
           // 内收 12：图里三枚图标中心只占 495px（舱宽 794px），比三等分窄一圈，
           // 所以整排要从胶囊边缘再退一点，不然最左/最右的图标会顶到圆角上。
           .padding({ left: 12, right: 12 })
@@ -1636,25 +1886,26 @@ struct IndexPage {
   @Builder
   navItem(icon: Resource, label: string, tabIndex: number) {
     Stack({ alignContent: Alignment.Center }) {
-      // 「光追」光斑：径向渐变，中心亮、边缘全透明。
-      // 用渐变而不是 shadow —— 阴影是实心色块加模糊，边界发灰；
-      // 渐变能自己安排衰减曲线，扩到最外圈时正好归零，看起来才是「光」。
-      // 颜色取品牌红的 RGB（深浅主题的主色 #E5484D / #F2555A 几乎一致，
-      // 一次写死即可，省掉一套只在 500ms 里出现的高光配色）。
+      // 按下反馈：手指压在哪一颗，哪一颗自己亮一圈。
+      // 声明式驱动（直接读 navPressIndex），不靠 setTimeout —— 按下即亮、
+      // 抬起即灭，中间不会出现「先灭一下再亮」的拖尾。
+      // 这层是「按下」的光，和下面那条会移动的光带互不干扰：
+      // 光带表示「我现在在哪」，这一圈表示「我正按着这里」。
       Column()
-        .width(54)
-        .height(54)
-        .borderRadius(27)
+        .width(62)
+        .height(62)
+        .borderRadius(31)
         .radialGradient({
           center: ['50%', '50%'],
-          radius: 27,
-          colors: [['#B3E5484D', 0], ['#40E5484D', 0.55], ['#00E5484D', 1]]
+          radius: 31,
+          colors: [['#7AFFFFFF', 0], ['#26FFFFFF', 0.6], ['#00FFFFFF', 1]]
         })
-        .opacity(this.navGlowTab === tabIndex ? this.navGlowAlpha : 0)
+        .opacity(this.navPressIndex === tabIndex ? 1 : 0)
         .scale({
-          x: this.navGlowTab === tabIndex ? this.navGlowScale : 0.5,
-          y: this.navGlowTab === tabIndex ? this.navGlowScale : 0.5
+          x: this.navPressIndex === tabIndex ? 1 : 0.68,
+          y: this.navPressIndex === tabIndex ? 1 : 0.68
         })
+        .animation({ duration: 180, curve: Curve.EaseOut })
 
       Column({ space: 4 }) {
         Image(icon)
@@ -1665,6 +1916,12 @@ struct IndexPage {
           // 图标不做染色，只改透明度。参考图里未选中项仍接近白（不是深灰），
           // 0.45 真机上显得发闷，提到 0.6，区分度靠「实心 / 描边」的图形差异。
           .opacity(this.activeTab === tabIndex ? 1 : 0.6)
+          // 按下时轻微回缩：给「点亮」一个按下去的前奏，松手弹回
+          .scale({
+            x: this.navPressIndex === tabIndex ? 0.9 : 1,
+            y: this.navPressIndex === tabIndex ? 0.9 : 1
+          })
+          .animation({ duration: 140, curve: Curve.EaseOut })
         Text(label)
           .fontSize(IndexPage.NAV_LABEL_SIZE)
           .fontWeight(this.activeTab === tabIndex ? FontWeight.Medium : FontWeight.Normal)
@@ -1675,29 +1932,51 @@ struct IndexPage {
     }
     .layoutWeight(1)
     .height('100%')
+    .onTouch((e: TouchEvent) => {
+      if (e.type === TouchType.Down) {
+        this.navPressIndex = tabIndex;
+      } else if (e.type === TouchType.Up || e.type === TouchType.Cancel) {
+        this.navPressIndex = -1;
+      }
+    })
     .onClick(() => {
-      this.triggerNavGlow(tabIndex);
+      this.moveNavGlow(tabIndex);
       this.selectTab(tabIndex);
     })
   }
 
+  /** 每一项的宽度（vp）：胶囊内宽减掉左右各 12 的内收，再三等分 */
+  private navCellW(): number {
+    const w: number = this.navRowW - 24;
+    return w > 0 ? w / 3 : 0;
+  }
+
   /**
-   * 导航按钮的「光追」：一团光从图标中心扩散出去并淡出。
+   * 白色光带移到某一颗。
    *
-   * 必须隔一帧再起动画：同一帧里把「亮起来」和「扩散 + 淡出」两次赋值写在一起，
-   * ArkUI 会把它们合并成一次状态更新，animateTo 只看得到终态 ——
-   * 现场表现就是完全没有动画（光斑根本没出现）。
+   * 两层各用**不同时长**（主体 380ms / 拖尾 560ms）分别 animateTo：
+   * 时长一样的话两层完全重合，视觉上只是一个光斑在平移；
+   * 拖尾慢下来之后，移动过程里能看到「光先到、尾巴随后收拢」，才有流光的味道。
+   *
+   * 第一次调用（navGlowAlpha 还是 0）额外把亮度从 0 升上来：
+   * 光带在中间那颗「浮现」，然后滑向被点的那一颗 ——
+   * 这正是「点击两侧按钮时，光影默认从中间按钮移过去」。
    */
-  private triggerNavGlow(index: number): void {
-    this.navGlowTab = index;
-    this.navGlowAlpha = 0.85;
-    this.navGlowScale = 0.45;
-    setTimeout(() => {
-      this.getUIContext().animateTo({ duration: 520, curve: Curve.EaseOut }, () => {
-        this.navGlowAlpha = 0;
-        this.navGlowScale = 1.3;
+  private moveNavGlow(index: number): void {
+    if (this.navGlowAlpha <= 0) {
+      this.getUIContext().animateTo({ duration: 260, curve: Curve.EaseOut }, () => {
+        this.navGlowAlpha = 1;
       });
-    }, 16);
+    }
+    if (this.navGlowIndex === index && this.navGlowLag === index) {
+      return;
+    }
+    this.getUIContext().animateTo({ duration: 380, curve: Curve.FastOutSlowIn }, () => {
+      this.navGlowIndex = index;
+    });
+    this.getUIContext().animateTo({ duration: 560, curve: Curve.FastOutSlowIn }, () => {
+      this.navGlowLag = index;
+    });
   }
 
   /**
@@ -1708,6 +1987,8 @@ struct IndexPage {
    * 那个方法是幂等的（已加载的源会直接跳过）。
    */
   private selectTab(index: number): void {
+    // 联想面板是全局浮层，不收起的话切到直播/我的还会挂在上面
+    this.closeSuggest();
     if (this.activeTab === index) {
       return;
     }
@@ -2057,7 +2338,7 @@ struct IndexPage {
           }
         } else {
           Grid() {
-            ForEach(this.recommendItems, (item: RecommendItem) => {
+            LazyForEach(this.recDataSource, (item: RecommendItem) => {
               GridItem() {
                 VodCard({
                   cardTitle: item.title,
@@ -2083,6 +2364,7 @@ struct IndexPage {
           .padding({ left: 16, right: 16 })
           .width('100%')
           .opacity(this.recSwitching ? 0.45 : 1)
+          .cachedCount(6)
         }
 
         if (this.recommendItems.length > 0) {
@@ -2351,6 +2633,15 @@ struct IndexPage {
 
   // ---------- 直播 ----------
 
+  /**
+   * 直播源叠卡视图：多张源卡先叠成一摞，点一下由前到后铺开。
+   *
+   * 这里只画每张卡的标题行 —— 叠着的时候不展开频道，
+   * 卡片高度固定 LIVE_CARD_H，才能和列表里的卡片一一对齐（换容器不跳）。
+   * 立体感来自三处：逐层向上的错位（LIVE_PILE_STEP）、逐层变小的缩放、
+   * 以及每张卡自己的投影（shadow 不能用状态色，深色底上会糊成一团）。
+   */
+
   @Builder
   liveContent() {
     // 外层 Stack 只为了在底部叠一个「收起」入口：
@@ -2381,132 +2672,27 @@ struct IndexPage {
         if (this.liveGroups.length === 0) {
           EmptyView({ emptyText: '暂无直播源，请前往「我的 → 视频源管理」添加' })
         } else {
-          List({ space: 10, scroller: this.liveScroller }) {
-            ForEach(this.liveGroups, (group: LiveGroupState) => {
+          List({ space: 0, scroller: this.liveScroller }) {
+            ForEach(this.liveGroups, (group: LiveGroupState, i: number) => {
               ListItem() {
-                Column({ space: 8 }) {
-                  Row({ space: 8 }) {
-                    Image($r('app.media.ic_live'))
-                      .width(20)
-                      .height(20)
-                    Text(group.sourceName)
-                      .fontSize(15)
-                      .fontWeight(FontWeight.Medium)
-                      .fontColor($r('app.color.color_text'))
-                      .layoutWeight(1)
-                      .maxLines(1)
-                    if (group.loaded) {
-                      Text(group.channels.length + ' 个频道')
-                        .fontSize(11)
-                        .fontColor($r('app.color.color_text_secondary'))
-                    } else if (group.loading) {
-                      Text('统计中…')
-                        .fontSize(11)
-                        .fontColor($r('app.color.color_text_secondary'))
-                    }
-                    Image($r('app.media.ic_back'))
-                      .width(16)
-                      .height(16)
-                      .rotate({ angle: this.arrowAngle(group) })
-                      .opacity(0.4)
-                  }
-                  .width('100%')
-                  .onClick(() => {
-                    this.toggleLiveGroup(group.sourceKey);
-                  })
-
-                  if (group.expanded) {
-                    if (group.loading) {
-                      LoadingView({ tipText: '加载频道…' }).height(90)
-                    } else if (group.error !== '') {
-                      Text(group.error)
-                        .fontSize(12)
-                        .fontColor($r('app.color.color_warning'))
-                        .width('100%')
-                        .textAlign(TextAlign.Start)
-                    } else if (group.channels.length === 0) {
-                      Text('未获取到频道')
-                        .fontSize(12)
-                        .fontColor($r('app.color.color_text_secondary'))
-                        .width('100%')
-                        .textAlign(TextAlign.Start)
-                    } else {
-                      Column({ space: 8 }) {
-                        ForEach(group.channels.slice(0, 300), (ch: LiveChannel) => {
-                          // 频道行以「台标」为主视觉：左台标 + 右侧小字频道名/节目单。
-                          // 纯文字列表很难一眼认出是哪个台，台标才是 IPTV 的正确形态。
-                          Row({ space: 12 }) {
-                            // 台标容器做成横向框（64x44）：IPTV 台标多是「台号+台名」的横版图，
-                            // 方形框会把它们缩得很小，留白也难看。
-                            Stack({ alignContent: Alignment.Center }) {
-                              if (ch.logo !== undefined && ch.logo !== '') {
-                                // Contain + 200x200 解码框：完整保留原图比例，不再被拉成横条
-                                // （旧写法按竖版海报 480x720 解码、再 Cover 裁切，台标必然变形）
-                                NetImage({ url: ch.logo, boxWidth: 200, boxHeight: 200, fit: ImageFit.Contain })
-                                  .width(64)
-                                  .height(44)
-                                  .borderRadius(6)
-                              } else {
-                                Text(ch.name.length > 0 ? ch.name.substring(0, 1) : '?')
-                                  .fontSize(20)
-                                  .fontColor($r('app.color.color_logo_plate_text'))
-                              }
-                            }
-                            // 台标底板用深色：CCTV 这类台标是白字透明底，
-                            // 衬在浅色底板上等于看不见
-                            .width(64)
-                            .height(44)
-                            .backgroundColor($r('app.color.color_logo_plate'))
-                            .borderRadius(6)
-                            .clip(true)
-
-                            Column({ space: 3 }) {
-                              Text(ch.name)
-                                .fontSize(15)
-                                .fontColor($r('app.color.color_text'))
-                                .maxLines(1)
-                                .textOverflow({ overflow: TextOverflow.Ellipsis })
-                                .width('100%')
-                                .textAlign(TextAlign.Start)
-                              if (this.epgTextFor(group, ch) !== '') {
-                                Text(this.epgTextFor(group, ch))
-                                  .fontSize(12)
-                                  .fontColor($r('app.color.color_text_secondary'))
-                                  .maxLines(1)
-                                  .textOverflow({ overflow: TextOverflow.Ellipsis })
-                                  .width('100%')
-                                  .textAlign(TextAlign.Start)
-                              }
-                            }
-                            .layoutWeight(1)
-                            .alignItems(HorizontalAlign.Start)
-                          }
-                          .width('100%')
-                          // 上下各 10vp：44 的台标 + 20 内边距 = 64vp 行高，点选不易误触隔壁
-                          .padding({ left: 6, right: 8, top: 10, bottom: 10 })
-                          .onClick(() => {
-                            this.openLive(group, ch);
-                          })
-                        }, (ch: LiveChannel) => ch.id)
-                      }
-                      .width('100%')
-                    }
-                  }
-                }
-                .width('100%')
-                // 展开时把让位空间画进卡片自身（见 liveCardTail / LIVE_EXPAND_TAIL）：
-                // List 的 padding 区永远露页面底色，卡片压不进去，
-                // 所以那条空白带只能靠卡片自己的下内边距「填」出来。
-                .padding({
-                  left: 12,
-                  right: 12,
-                  top: 12,
-                  bottom: 12 + this.liveCardTail(group)
+                LiveSourceCard({
+                  group: group,
+                  colorIndex: i % LIVE_CARD_PALETTE,
+                  firstInDeck: i === 0,
+                  onToggle: (key: string) => {
+                    this.toggleLiveGroup(key);
+                  },
+                  onPlay: (g: LiveGroupState, ch: LiveChannel) => {
+                    this.openLive(g, ch);
+                  },
+                  epgText: (g: LiveGroupState, ch: LiveChannel) => this.epgTextFor(g, ch)
                 })
-                .backgroundColor($r('app.color.color_glass'))
-                .borderRadius(10)
               }
-            }, (group: LiveGroupState) => this.liveGroupKey(group))
+              // 后一张永远压在前一张之上：叠边只吃上一张的底边，
+              // 所以展开的卡天然不会被上一张盖住标题 —— 不必再按 expanded
+              // 去抬 zIndex（那个判断只要没跟上状态，就会表现为「展开的卡被压住」）。
+              .zIndex(i)
+            }, (group: LiveGroupState) => group.sourceKey)
           }
         .layoutWeight(1)
         .scrollBar(BarState.Off)
@@ -2529,25 +2715,35 @@ struct IndexPage {
 
       if (this.longExpandedGroup() !== null) {
         Row({ space: 8 }) {
-          Text('收起频道列表')
+          Text('收起频道')
             .fontSize(13)
-            .fontColor(Color.White)
-          // 按钮底色固定深色，箭头必须恒白：ic_back 是主题色 PNG（浅色主题下深黑、
-          // 和底色融在一起），换专用的白色箭头图，不随主题变。
-          Image($r('app.media.ic_arrow_up_white'))
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.color_live_collapse_fg'))
+          // 箭头必须用可染色的 SVG：原来的 ic_arrow_up_white 是 PNG，
+          // fillColor 对 PNG 无效 —— 浅色主题（深胶囊配白箭头）能用，
+          // 深色主题换成浅胶囊时就成了白底白箭头。
+          Image($r('app.media.ic_chevron_up'))
             .width(14)
             .height(14)
-            .rotate({ angle: 90 })
+            .fillColor($r('app.color.color_live_collapse_fg'))
         }
         .padding({ left: 18, right: 18, top: 10, bottom: 10 })
-        .backgroundColor('#E61A1A1E')
+        // 胶囊与卡面「反着走」：浅色主题是深胶囊、深色主题是浅胶囊。
+        // 七种卡面色再怎么换，按钮永远是画面上对比最强的那一块 —— 不会再出现
+        // 「深卡 + 深胶囊」糊成一片的情况。
+        .backgroundColor($r('app.color.color_live_collapse_bg'))
         .borderRadius(22)
+        .shadow({
+          radius: 16,
+          color: $r('app.color.color_live_collapse_shadow'),
+          offsetY: 5
+        })
         // 必须整体落在底部磨砂过渡带**之上**（见 LIVE_COLLAPSE_LIFT）。
         // 之前贴 88vp，浮层下沿正好压在羽化段里 —— 那一段罩子已有 30% 上下的
         // 不透明度，表现为按钮下半截被"洗"进背景，看着像被过渡区遮住了。
         .margin({ bottom: IndexPage.LIVE_COLLAPSE_LIFT })
         .onClick(() => {
-          this.collapseLongGroups();
+          this.collapseAllGroups();
         })
       }
     }
@@ -2584,7 +2780,11 @@ struct IndexPage {
           bottom: 12
         })
 
-        Column({ space: 0 }) {
+        // 设置项整组做成一张圆角卡：外层只负责左右留白，内层上白底 + 20 圆角 +
+        // clip，行与行之间塞一条 0.5 的细分隔线（Column 没有 divider 属性，
+        // 只能自己插 Divider）。
+        Column() {
+          Column({ space: 0 }) {
           SettingsRow({
             rowTitle: '播放历史',
             rowValue: this.homeHistory.length > 0 ? this.homeHistory.length + ' 条' : '',
@@ -2592,6 +2792,10 @@ struct IndexPage {
               this.pushHistory();
             }
           })
+          Divider()
+            .strokeWidth(0.5)
+            .color($r('app.color.color_divider'))
+            .margin({ left: 18, right: 18 })
           SettingsRow({
             rowTitle: '我的收藏',
             rowValue: this.favCount > 0 ? this.favCount + ' 个' : '',
@@ -2599,6 +2803,10 @@ struct IndexPage {
               this.pushFavorites();
             }
           })
+          Divider()
+            .strokeWidth(0.5)
+            .color($r('app.color.color_divider'))
+            .margin({ left: 18, right: 18 })
           SettingsRow({
             rowTitle: '视频源管理',
             rowValue: this.vodCount + ' 点播 / ' + this.liveCount + ' 直播',
@@ -2606,6 +2814,10 @@ struct IndexPage {
               this.pushSources();
             }
           })
+          Divider()
+            .strokeWidth(0.5)
+            .color($r('app.color.color_divider'))
+            .margin({ left: 18, right: 18 })
           SettingsRow({
             rowTitle: '下载管理',
             rowValue: this.downloadCount > 0 ? this.downloadCount + ' 个任务' : '',
@@ -2613,6 +2825,10 @@ struct IndexPage {
               this.pushDownloads();
             }
           })
+          Divider()
+            .strokeWidth(0.5)
+            .color($r('app.color.color_divider'))
+            .margin({ left: 18, right: 18 })
           SettingsRow({
             rowTitle: '设置',
             rowValue: '',
@@ -2629,6 +2845,17 @@ struct IndexPage {
               this.pushAbout();
             }
           })
+          }
+          .width('100%')
+          // 深色主题下页面底色是纯色 #191922，而 color_card 是 #1C1C22 ——
+          // 每通道只差 3 级，整张卡（尤其下边框）直接糊进背景，看着像没有边界。
+          // 所以卡面改用「抬升一档」的 color_card_raised（浅色仍是纯白，
+          // 深色换成 #23232B），再加一根 0.5vp 发丝描边把轮廓定住；
+          // 浅色主题的描边是全透明，和原来像素一致。
+          .backgroundColor($r('app.color.color_card_raised'))
+          .border({ width: 0.5, color: $r('app.color.color_card_raised_border') })
+          .borderRadius(20)
+          .clip(true)
         }
         .width('100%')
         .padding({ left: 16, right: 16 })
@@ -2648,5 +2875,252 @@ struct IndexPage {
     }
     .scrollBar(BarState.Off)
     .layoutWeight(1)
+  }
+}
+
+
+/**
+ * 直播源卡片：一块整色卡，收起时只露标题条，展开时长出频道列表。
+ *
+ * 为什么必须是独立 @Component + @ObjectLink：
+ * 写在 ForEach 里内联渲染时，expanded 一变整项会被重建（key 变了），
+ * 高度是瞬间跳的、animateTo 吃不到；独立组件靠 @ObjectLink 原地重排，
+ * 卡片高度和下面卡片的位移才是真正连续的动画。
+ *
+ * 配色是一整摞彩色浅卡：浅底 + 近黑字。原来第一张是墨黑，展开后底部
+ * 「收起频道」黑色浮层压在黑卡上完全看不清，现在全套浅色，浮层恒定可辨。
+ */
+@Component
+struct LiveSourceCard {
+  @ObjectLink @Watch('onGroupChanged') group: LiveGroupState;
+  /** 用第几套配色（按源顺序循环） */
+  @Prop colorIndex: number = 0;
+  /** 是不是这一摞的第一张：第一张不用留上间距 */
+  @Prop firstInDeck: boolean = false;
+  /** 当前已经铺出来的频道行数（分页渲染，见 LIVE_FIRST_ROWS） */
+  @State visibleRows: number = 0;
+  onToggle: (key: string) => void = (key: string) => {};
+  onPlay: (g: LiveGroupState, ch: LiveChannel) => void = (g: LiveGroupState, ch: LiveChannel) => {};
+  epgText: (g: LiveGroupState, ch: LiveChannel) => string = (g: LiveGroupState, ch: LiveChannel) => '';
+
+  /**
+   * 卡面底色（第 colorIndex 套）。
+   *
+   * 必须走 $r 资源：浅色主题是淡彩卡，深色主题是低饱和暗彩卡，
+   * 两套色值分别在 base / dark 的 color.json 里，切系统深色时整摞卡自动换。
+   * 写成 switch 而不是数组下标，是因为 Resource 对象不能在文件级常量里初始化。
+   */
+  private cardBg(): ResourceColor {
+    switch (this.colorIndex % LIVE_CARD_PALETTE) {
+      case 1: return $r('app.color.color_live_card_2');
+      case 2: return $r('app.color.color_live_card_3');
+      case 3: return $r('app.color.color_live_card_4');
+      case 4: return $r('app.color.color_live_card_5');
+      case 5: return $r('app.color.color_live_card_6');
+      case 6: return $r('app.color.color_live_card_7');
+      default: return $r('app.color.color_live_card_1');
+    }
+  }
+
+  /** 卡面前景色：浅色主题近黑字、深色主题近白字 */
+  private fg(): ResourceColor {
+    return $r('app.color.color_live_card_fg');
+  }
+
+  /** 台标底板：浅卡用深色半透明、暗卡用浅色半透明 */
+  private plate(): ResourceColor {
+    return $r('app.color.color_live_card_plate');
+  }
+
+  aboutToAppear(): void {
+    // 组件也可能是在「已展开」状态下被创建出来的（列表重建、返回页面），
+    // 这时 @Watch 不会触发，得自己铺一次首屏行数。
+    this.onGroupChanged();
+  }
+
+  /** expanded / loading / channels 任何一个变了都会进来 */
+  onGroupChanged(): void {
+    const cap = this.rowsCap();
+    if (!this.group.expanded) {
+      this.visibleRows = 0;
+      return;
+    }
+    if (this.visibleRows === 0 || this.visibleRows > cap) {
+      this.visibleRows = Math.min(LIVE_FIRST_ROWS, cap);
+    }
+  }
+
+  /** 实际要铺的行数上限（1022 个频道的源也只铺前 300 行） */
+  private rowsCap(): number {
+    const n: number = this.group.channels.length;
+    return n > LIVE_MAX_ROWS ? LIVE_MAX_ROWS : n;
+  }
+
+  /** 滑到底再补一批 */
+  private appendRows(): void {
+    const cap = this.rowsCap();
+    if (this.visibleRows < cap) {
+      this.visibleRows = Math.min(cap, this.visibleRows + LIVE_MORE_ROWS);
+    }
+  }
+
+  build() {
+    Column() {
+      // 标题行 —— 叠起来时露出来的就是这一条
+      Row({ space: 10 }) {
+        Column({ space: 3 }) {
+          Text(this.group.sourceName)
+            .fontSize(21)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(this.fg())
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .width('100%')
+            .textAlign(TextAlign.Start)
+          if (this.group.expanded) {
+            Text(this.group.channels.length.toString() + ' 个频道 · 点频道直接播放')
+              .fontSize(11)
+              .fontColor(this.fg())
+              .opacity(0.55)
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .width('100%')
+              .textAlign(TextAlign.Start)
+          }
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start)
+
+        if (this.group.loading) {
+          Text('统计中')
+            .fontSize(13)
+            .fontColor(this.fg())
+            .opacity(0.6)
+        } else {
+          Text(this.group.loaded ? this.group.channels.length.toString() : '—')
+            .fontSize(15)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.fg())
+            .opacity(0.8)
+        }
+      }
+      .width('100%')
+      .height(LIVE_HEADER_H)
+      .onClick(() => {
+        this.onToggle(this.group.sourceKey);
+      })
+
+      if (this.group.expanded) {
+        if (this.group.loading) {
+          LoadingView({ tipText: '加载频道…' }).height(90)
+        } else if (this.group.error !== '') {
+          Text(this.group.error)
+            .fontSize(12)
+            .fontColor(this.fg())
+            .opacity(0.7)
+            .width('100%')
+            .textAlign(TextAlign.Start)
+            .padding({ bottom: 16 })
+        } else if (this.group.channels.length === 0) {
+          Text('未获取到频道')
+            .fontSize(12)
+            .fontColor(this.fg())
+            .opacity(0.7)
+            .width('100%')
+            .textAlign(TextAlign.Start)
+            .padding({ bottom: 16 })
+        } else {
+          Column() {
+            // 只铺 visibleRows 行：1000+ 频道的源如果一次建 300 行（每行还带
+            // 一个 NetImage 子组件），展开那一下要卡近 1 秒，看着就是「点了没反应」。
+            // 现在先铺 24 行让卡片立刻长出来，剩下的滑到底部再补齐。
+            ForEach(this.group.channels.slice(0, this.visibleRows), (ch: LiveChannel) => {
+              // 频道行以台标为主视觉：左台标 + 右侧频道名/节目单
+              Row({ space: 12 }) {
+                Stack({ alignContent: Alignment.Center }) {
+                  if (ch.logo !== undefined && ch.logo !== '') {
+                    NetImage({ url: ch.logo, boxWidth: 200, boxHeight: 200, fit: ImageFit.Contain })
+                      .width(64)
+                      .height(44)
+                      .borderRadius(6)
+                  } else {
+                    Text(ch.name.length > 0 ? ch.name.substring(0, 1) : '?')
+                      .fontSize(20)
+                      .fontColor(this.fg())
+                      .opacity(0.75)
+                  }
+                }
+                .width(64)
+                .height(44)
+                .backgroundColor(this.plate())
+                .borderRadius(8)
+                .clip(true)
+
+                Column({ space: 3 }) {
+                  Text(ch.name)
+                    .fontSize(15)
+                    .fontColor(this.fg())
+                    .maxLines(1)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
+                    .width('100%')
+                    .textAlign(TextAlign.Start)
+                  if (this.epgText(this.group, ch) !== '') {
+                    Text(this.epgText(this.group, ch))
+                      .fontSize(12)
+                      .fontColor(this.fg())
+                      .opacity(0.55)
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                      .width('100%')
+                      .textAlign(TextAlign.Start)
+                  }
+                }
+                .layoutWeight(1)
+                .alignItems(HorizontalAlign.Start)
+              }
+              .width('100%')
+              .padding({ left: 2, right: 2, top: 9, bottom: 9 })
+              .onClick(() => {
+                this.onPlay(this.group, ch);
+              })
+            }, (ch: LiveChannel) => ch.id)
+
+            // 底部哨兵：真正出现在可视区里才补下一批。
+            // 用 onVisibleAreaChange 而不是 onAppear —— Column 里的节点是一次性
+            // 全建出来的，onAppear 一挂上就立刻触发，等于没分页。
+            if (this.visibleRows < this.rowsCap()) {
+              Text('继续上滑加载（还有 ' + (this.rowsCap() - this.visibleRows).toString() + ' 个频道）')
+                .fontSize(12)
+                .fontColor(this.fg())
+                .opacity(0.45)
+                .width('100%')
+                .height(44)
+                .textAlign(TextAlign.Center)
+                .onVisibleAreaChange([0.0, 0.01], (isVisible: boolean, currentRatio: number) => {
+                  if (isVisible && currentRatio > 0) {
+                    this.appendRows();
+                  }
+                })
+            }
+          }
+          .width('100%')
+          .padding({ bottom: 14 })
+        }
+      }
+    }
+    .width('100%')
+    .padding({ left: 18, right: 18 })
+    .backgroundColor(this.cardBg())
+    .borderRadius(20)
+    .clip(true)
+    // 叠边全靠「自己这一张」的状态决定：收起的卡把下一张往上拉一个重叠量，
+    // 展开的卡不拉。不再由外面算好间距再传进来 —— 之前那套在切换深浅主题后
+    // 会算错（外面认为还是收起的），结果就是展开的卡压住下一张的标题。
+    .margin({
+      top: this.firstInDeck ? 0 : LIVE_CARD_GAP,
+      bottom: this.group.expanded ? 0 : -LIVE_STACK_OVERLAP
+    })
+    // 收起态固定成一个「标题条 + 一点余量」的高度；展开后交给内容撑
+    .constraintSize({ minHeight: this.group.expanded ? 0 : LIVE_CARD_H })
   }
 }

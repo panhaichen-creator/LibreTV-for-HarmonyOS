@@ -37,6 +37,21 @@ const THUMB_MAX_BYTES: number = 30 * 1024;
 const WECHAT_HINT: string = '打开后选择「在浏览器打开」播放';
 
 export class ShareService {
+  /**
+   * 应用展示名（资源 brand_name）。
+   *
+   * 分享文案里的「来自 X」必须走这里，不要在页面里写死品牌字面量：
+   * 品牌名由 scripts/brand.js 在构建时写进 brand_name（开源构建是 LibreTV，
+   * 本机安装包可能是另一个名字），写死就会出现「应用名与分享卡片对不上」。
+   */
+  static brandName(ctx: common.UIAbilityContext): string {
+    try {
+      return ctx.resourceManager.getStringByNameSync('brand_name');
+    } catch (e) {
+      return '';
+    }
+  }
+
   private static cache: Map<string, Uint8Array> = new Map();
   private static inflight: Map<string, Promise<Uint8Array | undefined>> = new Map();
 
@@ -120,7 +135,15 @@ export class ShareService {
       const link: string = ShareLink.build(target);
       const thumb: Uint8Array | undefined = await ShareService.thumb(target.pic, 1500);
       // 片名在前、提示在后：微信只展示一行标题，提示必须紧跟片名才不会被截掉
-      const head: string = target.title !== '' ? target.title : 'LibreTV';
+      // 兜底标题用应用自己的名字（资源 brand_name），别写死品牌字面量：
+      // 换品牌 / 上架改名时这里会跟着变
+      let appName: string = '';
+      try {
+        appName = ctx.resourceManager.getStringByNameSync('brand_name');
+      } catch (e) {
+        appName = '';
+      }
+      const head: string = target.title !== '' ? target.title : appName;
       const record: systemShare.SharedRecord = {
         utd: utd.UniformDataType.HYPERLINK,
         title: head + '｜' + WECHAT_HINT,

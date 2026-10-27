@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 视频源管理页：点播源（Apple CMS）/ 直播源（M3U）增删改测、订阅导入导出
  */
 
@@ -17,6 +17,7 @@ import { pageBgGradient } from '../common/GlassTheme';
 import { Brand } from '../common/Brand';
 import { SystemInsets } from '../common/SystemInsets';
 import { BlurFade } from '../common/BlurFade';
+import { curves } from '@kit.ArkUI';
 
 @Component
 export struct SourcesPage {
@@ -536,6 +537,9 @@ export struct SourcesPage {
   build() {
     NavDestination() {
       Stack({ alignContent: Alignment.Bottom }) {
+        // ── 指光：跟着手指走的柔光 ──────────────────────────────────────
+        // 系统材质对页面内容区的按钮不生效（作用域限制），
+        // 这层光是自己画的：按下哪个按钮，光就落在那儿并跟着手走。
         // 主内容 + 导航条包一层 Top 对齐的 Stack：
         // 外层是 Bottom 对齐（给底部浮层面板用），不能让导航条也跟着贴底
         Stack({ alignContent: Alignment.Top }) {
@@ -545,21 +549,30 @@ export struct SourcesPage {
             TabContent() {
               this.vodPanel()
             }
-            .tabBar('点播源 (' + this.vodSources.length + ')')
+            .tabBar(this.tabChip(0))
 
             TabContent() {
               this.livePanel()
             }
-            .tabBar('直播源 (' + this.liveSources.length + ')')
+            .tabBar(this.tabChip(1))
           }
-          .barHeight(44)
-          // 标签栏也走玻璃：底色透明 + 背景模糊，页面渐变会透上来
+          // 两颗圆角立体按钮代替原来的纯文字标签：文字点击区域只有十几个 vp 高，
+          // 手指很难点准。玻璃底去掉 —— 按钮自己带底和投影，再垫一层模糊只会在
+          // 底部多出一条色带边界。
+          .barHeight(52)
           .barBackgroundColor(Color.Transparent)
-          .barBackgroundEffect({ radius: 24, saturation: 1.5 })
+          // 必须同步回来：activeTab 只往 Tabs 单向传 index 的话它永远是 0，
+          // 点「直播源」后按钮的高亮不会跟着走。
+          .onChange((index: number) => {
+            this.activeTab = index;
+          })
           .layoutWeight(1)
         }
         .width('100%')
         .height('100%')
+        // 底部让出一段：标签栏原来是贴着屏幕最下沿的，按钮底边正好压在手势条上，
+        // 点按容易误触返回手势，看着也局促。留白由渐变兜住，仍然是整屏背景。
+        .padding({ bottom: 8 + SystemInsets.bottom() })
         .linearGradient(pageBgGradient())
         // 底色必须铺进状态栏/手势条：二级页面的内容让出了安全区，
         // 这一层不扩的话，状态栏里透出的是窗口默认底色，
@@ -637,13 +650,66 @@ export struct SourcesPage {
     })
   }
 
+  /**
+   * 底部标签按钮：圆角 + 投影 + 描边，做出「按得下去」的立体块感。
+   *
+   * 参数按值传递（@Builder 的老毛病），这里只用它区分是哪一栏；
+   * 高亮状态和数量都直接读 this，才能跟着状态刷新。
+   */
+  @Builder
+  tabChip(kind: number) {
+    Row() {
+      Row() {
+        Text(kind === 0 ? '点播源' : '直播源')
+          .fontSize(14)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.activeTab === kind ? Color.White : $r('app.color.color_text'))
+          .maxLines(1)
+        Text(kind === 0 ? this.vodSources.length.toString() : this.liveSources.length.toString())
+          .fontSize(11)
+          .fontColor(this.activeTab === kind ? Color.White : $r('app.color.color_text_secondary'))
+          .backgroundColor(this.activeTab === kind ? '#33FFFFFF' : '#14000000')
+          .borderRadius(8)
+          .padding({ left: 6, right: 6, top: 1, bottom: 1 })
+          .margin({ left: 6 })
+          .maxLines(1)
+      }
+      .width('100%')
+      .height(40)
+      .justifyContent(FlexAlign.Center)
+      .borderRadius(20)
+      .backgroundColor(this.activeTab === kind
+        ? $r('app.color.color_primary')
+        : $r('app.color.color_card'))
+      // 「立体」靠三样：外投影把块托起来、细描边勾出边缘、
+      // 选中态再用主题色投影做一点辉光。
+      .shadow({
+        radius: this.activeTab === kind ? 14 : 8,
+        color: this.activeTab === kind ? '#4DE5484D' : '#26000000',
+        offsetY: this.activeTab === kind ? 5 : 3
+      })
+      .border({
+        width: 1,
+        color: this.activeTab === kind ? '#33FFFFFF' : '#14000000'
+      })
+    }
+    .width('100%')
+    // 左右各让 16：和导航条、列表卡片用的是同一个边距。
+    // 之前只让 5，两颗按钮几乎顶到屏幕边缘，看着比整页都宽出一圈。
+    // 中间只留 4+4 的缝，两颗按钮之间不散开。
+    .padding({
+      left: kind === 0 ? 16 : 4,
+      right: kind === 1 ? 16 : 4
+    })
+  }
+
   @Builder
   vodPanel() {
     Column({ space: 10 }) {
       // 顶部占位：让内容不被浮在上面的玻璃导航条遮住
       Column()
         .width('100%')
-        .height(56 + SystemInsets.top())
+        .height(64 + SystemInsets.top())
       Row({ space: 8 }) {
         Button() {
           Text('添加点播源')
@@ -769,7 +835,7 @@ export struct SourcesPage {
       // 顶部占位：让内容不被浮在上面的玻璃导航条遮住
       Column()
         .width('100%')
-        .height(56 + SystemInsets.top())
+        .height(64 + SystemInsets.top())
       Button() {
         Text('添加直播源')
           .fontSize(13)
@@ -871,27 +937,37 @@ export struct SourcesPage {
         .backgroundColor($r('app.color.color_chip_bg'))
         .borderRadius(8)
         .padding({ left: 10, right: 10 })
-      Row({ space: 16 }) {
-        Text('取消')
-          .fontSize(13)
-          .fontColor($r('app.color.color_text_secondary'))
-          .layoutWeight(1)
-          .onClick(() => {
-            this.showAddVod = false;
-          })
-        Text('确定')
-          .fontSize(13)
-          .fontColor($r('app.color.color_primary'))
-          .layoutWeight(1)
-          .textAlign(TextAlign.RIGHT)
-          .onClick(() => {
-            this.addVod();
-          })
+      Row({ space: 12 }) {
+        Button() {
+          Text('取消')
+            .fontSize(14)
+            .fontColor($r('app.color.color_text_secondary'))
+        }
+        .layoutWeight(1)
+        .height(40)
+        .backgroundColor($r('app.color.color_chip_bg'))
+        .borderRadius(8)
+        .onClick(() => {
+          this.showAddVod = false;
+        })
+        Button() {
+          Text('确定')
+            .fontSize(14)
+            .fontColor(Color.White)
+        }
+        .layoutWeight(1)
+        .height(40)
+        .backgroundColor($r('app.color.color_primary'))
+        .borderRadius(8)
+        .onClick(() => {
+          this.addVod();
+        })
       }
       .width('100%')
     }
     .width('100%')
-    .padding(12)
+    .padding({ left: 16, right: 16, top: 16, bottom: 16 })
+    .margin({ left: 12, right: 12, bottom: 12 + SystemInsets.bottom() })
     .backgroundColor($r('app.color.color_panel_glass'))
     .backgroundEffect({ radius: 26, saturation: 1.5 })
     .border({ width: 1, color: $r('app.color.color_nav_border') })
@@ -919,27 +995,37 @@ export struct SourcesPage {
         .backgroundColor($r('app.color.color_chip_bg'))
         .borderRadius(8)
         .padding({ left: 10, right: 10 })
-      Row({ space: 16 }) {
-        Text('取消')
-          .fontSize(13)
-          .fontColor($r('app.color.color_text_secondary'))
-          .layoutWeight(1)
-          .onClick(() => {
-            this.showAddLive = false;
-          })
-        Text('确定')
-          .fontSize(13)
-          .fontColor($r('app.color.color_primary'))
-          .layoutWeight(1)
-          .textAlign(TextAlign.RIGHT)
-          .onClick(() => {
-            this.addLive();
-          })
+      Row({ space: 12 }) {
+        Button() {
+          Text('取消')
+            .fontSize(14)
+            .fontColor($r('app.color.color_text_secondary'))
+        }
+        .layoutWeight(1)
+        .height(40)
+        .backgroundColor($r('app.color.color_chip_bg'))
+        .borderRadius(8)
+        .onClick(() => {
+          this.showAddLive = false;
+        })
+        Button() {
+          Text('确定')
+            .fontSize(14)
+            .fontColor(Color.White)
+        }
+        .layoutWeight(1)
+        .height(40)
+        .backgroundColor($r('app.color.color_primary'))
+        .borderRadius(8)
+        .onClick(() => {
+          this.addLive();
+        })
       }
       .width('100%')
     }
     .width('100%')
-    .padding(12)
+    .padding({ left: 16, right: 16, top: 16, bottom: 16 })
+    .margin({ left: 12, right: 12, bottom: 12 + SystemInsets.bottom() })
     .backgroundColor($r('app.color.color_panel_glass'))
     .backgroundEffect({ radius: 26, saturation: 1.5 })
     .border({ width: 1, color: $r('app.color.color_nav_border') })

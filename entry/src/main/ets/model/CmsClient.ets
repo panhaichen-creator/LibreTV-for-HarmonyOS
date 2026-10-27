@@ -173,6 +173,7 @@ export class CmsClient {
         director: CmsClient.optStr(vod['vod_director']),
         actor: CmsClient.optStr(vod['vod_actor']),
         remarks: CmsClient.optStr(vod['vod_remarks']),
+        score: CmsClient.optStr(vod['vod_score']),
         sourceKey: source.key,
         sourceName: source.name,
         sourceUrl: source.url,

@@ -15,6 +15,7 @@ import { latestNavParam } from '../common/NavParam';
 import { SystemInsets } from '../common/SystemInsets';
 import { BlurFade } from '../common/BlurFade';
 
+
 export interface HistoryPageParam {
   /** history / favorites */
   mode: string;
@@ -157,7 +158,7 @@ export struct HistoryPage {
                 .width('100%')
                 .height(56 + SystemInsets.top())
             }
-                ForEach(this.records, (rec: PlayRecord) => {
+                ForEach(this.records, (rec: PlayRecord, index: number) => {
                   ListItem() {
                     Row({ space: 10 }) {
                       if (rec.pic !== undefined && rec.pic !== '') {
@@ -274,7 +275,7 @@ export struct HistoryPage {
                 .height(56 + SystemInsets.top())
             }
                 // 直播频道收藏：台标 + 频道名，点击直接进直播播放
-                ForEach(this.liveFavorites, (fav: LiveFavoriteItem) => {
+                ForEach(this.liveFavorites, (fav: LiveFavoriteItem, favIdx: number) => {
                   ListItem() {
                     Row({ space: 10 }) {
                       if (fav.logo !== undefined && fav.logo !== '') {
@@ -304,16 +305,18 @@ export struct HistoryPage {
                           .fontColor($r('app.color.color_text_secondary'))
                           .width('100%')
                           .textAlign(TextAlign.Start)
-                        Text('取消收藏')
-                          .fontSize(12)
-                          .fontColor($r('app.color.color_text_secondary'))
-                          .onClick(() => {
-                            HistoryStore.shared().removeLiveFavorite(fav.url);
-                            this.refresh();
-                          })
-                      }
-                      .layoutWeight(1)
-                      .alignItems(HorizontalAlign.Start)
+                        Row() {
+                          Text('取消收藏')
+                            .fontSize(12)
+                            .fontColor($r('app.color.color_text_secondary'))
+                            .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+                            .onClick(() => {
+                              HistoryStore.shared().removeLiveFavorite(fav.url);
+                              this.refresh();
+                            })
+                          Blank()
+                        }
+                        .layoutWeight(1)
                     }
                     .width('100%')
                     .padding(10)
@@ -323,9 +326,10 @@ export struct HistoryPage {
                       this.openLive(fav);
                     })
                   }
+                }
                 }, (fav: LiveFavoriteItem) => 'live_' + fav.url)
 
-                ForEach(this.favorites, (fav: FavoriteItem) => {
+                ForEach(this.favorites, (fav: FavoriteItem, favIdx: number) => {
                   ListItem() {
                     Row({ space: 10 }) {
                       if (fav.pic !== undefined && fav.pic !== '') {
@@ -355,16 +359,18 @@ export struct HistoryPage {
                           .fontColor($r('app.color.color_text_secondary'))
                           .width('100%')
                           .textAlign(TextAlign.Start)
-                        Text('取消收藏')
-                          .fontSize(12)
-                          .fontColor($r('app.color.color_text_secondary'))
-                          .onClick(() => {
-                            HistoryStore.shared().removeFavorite(fav.sourceKey, fav.vodId);
-                            this.refresh();
-                          })
-                      }
-                      .layoutWeight(1)
-                      .alignItems(HorizontalAlign.Start)
+                        Row() {
+                          Text('取消收藏')
+                            .fontSize(12)
+                            .fontColor($r('app.color.color_text_secondary'))
+                            .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+                            .onClick(() => {
+                              HistoryStore.shared().removeFavorite(fav.sourceKey, fav.vodId);
+                              this.refresh();
+                            })
+                          Blank()
+                        }
+                        .layoutWeight(1)
                     }
                     .width('100%')
                     .padding(10)
@@ -374,6 +380,7 @@ export struct HistoryPage {
                       this.openDetail(fav.sourceKey, fav.vodId, fav.name);
                     })
                   }
+                }
                 }, (fav: FavoriteItem) => fav.sourceKey + '_' + fav.vodId)
               }
               .layoutWeight(1)

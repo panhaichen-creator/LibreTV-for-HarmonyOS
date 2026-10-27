@@ -13,6 +13,7 @@ import { PlayerPageParam } from './PlayerPage';
 import { SystemInsets } from '../common/SystemInsets';
 import { BlurFade } from '../common/BlurFade';
 
+
 @Component
 export struct DownloadsPage {
   navPathStack: NavPathStack = new NavPathStack();
@@ -261,7 +262,7 @@ export struct DownloadsPage {
                   .padding({ left: 2, top: 6, bottom: 2 })
                   .textAlign(TextAlign.Start)
               }
-              ForEach(this.tasks, (task: DownloadTaskRecord) => {
+              ForEach(this.tasks, (task: DownloadTaskRecord, index: number) => {
                 ListItem() {
                   Row({ space: 10 }) {
                     // 影片封面：尺寸与「观看历史」那一栏完全一致（80×110、圆角 8），

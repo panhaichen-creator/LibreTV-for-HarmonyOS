@@ -10,6 +10,7 @@ import { pageBgGradient } from '../common/GlassTheme';
 import { SystemInsets } from '../common/SystemInsets';
 import { BlurFade } from '../common/BlurFade';
 
+
 @Component
 export struct AboutPage {
   navPathStack: NavPathStack = new NavPathStack();

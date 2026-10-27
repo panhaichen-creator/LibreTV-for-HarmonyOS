@@ -30,6 +30,18 @@
 
 ---
 
+## 📺 Android TV 版
+
+另有一个同一套能力的**电视盒子 / Android TV 版本**（Kotlin + Compose + Media3），目前**不在本仓库内**：
+
+- 界面按电视设计稿重做，遥控器全程可操作
+- 补上了鸿蒙平台做不到的两件事：**TVBox Spider 引擎**（动态加载 spider JAR）与**网盘直连播放**（夸克 / UC / 阿里云盘 / WebDAV）
+- 产出可安装的 APK（`app/build/outputs/apk/release/app-release.apk`）
+
+> 之所以没并入本仓库：它自带数百 MB 的预编译产物和一套独立的签名材料，混在一起会让只想编译鸿蒙端的人多下载十倍体积。整理成干净的子集后会单独开仓库。
+
+---
+
 ## 截图
 
 <div align="center">

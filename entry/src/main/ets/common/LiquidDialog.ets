@@ -23,8 +23,6 @@
  * 所以点按钮时可以直接 this.controller?.close() 关掉自己。
  */
 
-import { GlassMaterial } from './GlassMaterial';
-
 @CustomDialog
 export struct LiquidDialog {
   message: string = '';
@@ -79,8 +77,6 @@ export struct LiquidDialog {
     // 玻璃底：半透明 + 背景模糊
     .backgroundColor($r('app.color.color_panel_glass'))
     .backgroundBlurStyle(BlurStyle.COMPONENT_THICK)
-    // 液态玻璃材质接管背景与边框（设备支持时）
-    .systemMaterial(GlassMaterial.supported ? GlassMaterial.liquid : undefined)
     // 折射边：细描边，模拟玻璃棱边
     .border({ width: 1, color: $r('app.color.color_liquid_edge') })
     .shadow({ radius: 30, color: '#40000000', offsetY: 10 })

@@ -2,7 +2,7 @@
   "color": [
     {
       "name": "start_window_background",
-      "value": "#101014"
+      "value": "#191922"
     },
     {
       "name": "color_primary",
@@ -138,15 +138,95 @@
     },
     {
       "name": "color_veil_b_soft",
-      "value": "#662E2723"
+      "value": "#FF191922"
     },
     {
       "name": "color_veil_b_deep",
-      "value": "#F72E2723"
+      "value": "#FF191922"
     },
     {
       "name": "color_veil_b_clear",
-      "value": "#002E2723"
+      "value": "#00191922"
+    },
+    {
+      "name": "color_page_bg",
+      "value": "#191922"
+    },
+    {
+      "name": "color_live_card_1",
+      "value": "#2F2B47"
+    },
+    {
+      "name": "color_live_card_2",
+      "value": "#33401F"
+    },
+    {
+      "name": "color_live_card_3",
+      "value": "#34343C"
+    },
+    {
+      "name": "color_live_card_4",
+      "value": "#45331F"
+    },
+    {
+      "name": "color_live_card_5",
+      "value": "#253746"
+    },
+    {
+      "name": "color_live_card_6",
+      "value": "#402C34"
+    },
+    {
+      "name": "color_live_card_7",
+      "value": "#2A3D36"
+    },
+    {
+      "name": "color_live_card_fg",
+      "value": "#E8E8EE"
+    },
+    {
+      "name": "color_live_card_plate",
+      "value": "#26FFFFFF"
+    },
+    {
+      "name": "color_live_collapse_bg",
+      "value": "#F5EDEDF2"
+    },
+    {
+      "name": "color_live_collapse_fg",
+      "value": "#16161B"
+    },
+    {
+      "name": "color_live_collapse_shadow",
+      "value": "#80000000"
+    },
+    {
+      "name": "color_card_raised",
+      "value": "#23232B"
+    },
+    {
+      "name": "color_card_raised_border",
+      "value": "#2BFFFFFF"
+    },
+    {
+      "name": "color_download",
+      "value": "#2E7BF6"
+    },
+    {
+      "name": "color_nav_glow_core",
+      "value": "#59FFFFFF"
+    },
+    {
+      "name": "color_nav_glow_mid",
+      "value": "#1FFFFFFF"
+    },
+    {
+      "name": "color_nav_glow_soft",
+      "value": "#14FFFFFF"
+    },
+    {
+      "name": "color_nav_glow_clear",
+      "value": "#00FFFFFF"
     }
   ]
 }

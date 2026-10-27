@@ -51,7 +51,7 @@ scripts/.brand-local.json
 
 # ---------- 发布脚本的本机配置 ----------
 # scripts/package-release.js 从这里读「桌面在哪」。桌面被重定向到别的盘时
-# （本机为 D:\Users\PPLC\Desktop）USERPROFILE\Desktop 是不存在的，必须有这层配置。
+# （桌面被重定向到别的盘时）USERPROFILE\Desktop 是不存在的，必须有这层配置。
 scripts/.release-desktop.json
 
 # ---------- 开发过程杂物（截图、日志、一次性补丁脚本）----------
@@ -80,6 +80,7 @@ verify_*.jpg
 # 一个 build_bak 目录就有几十 MB，混进提交会把仓库撑爆。
 /entry/build_old_*/
 /entry/build_bak_*/
+/build_bak_*/
 /.hvigor_old_*/
 /.hvigor_bak_*/
 /hvigor_old_*/
@@ -89,3 +90,17 @@ verify_*.jpg
 *.zip
 *.7z
 *.rar
+
+# ---------- AI 助手的本地记忆 / 工具链 ----------
+# 含本机绝对路径、操作记录，属于开发过程产物，不进仓库
+.workbuddy-ai/
+
+# ---------- Android TV 端工程 ----------
+# README 的「Android TV 版」一节讲的就是这个目录，但它现在有 409MB：
+# 里面是 build 产物、apk、上百张调试截图，还有 libretv.jks 密钥库与
+# keystore.properties —— 未经脱敏不能进仓库。要开源请先裁出「只含源码 +
+# Gradle 配置」的子集，再单独提交。
+/android/
+
+# ---------- 根目录临时截图 ----------
+/qb6.jpeg

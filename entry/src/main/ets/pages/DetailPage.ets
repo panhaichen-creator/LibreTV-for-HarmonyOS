@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 视频详情页：简介 / 选集 / 播放 / 收藏 / 换源测速 / 下载
  */
 
@@ -18,13 +18,19 @@ import { PlayerPageParam } from './PlayerPage';
 import { latestNavParam } from '../common/NavParam';
 import { SystemInsets } from '../common/SystemInsets';
 import { BlurFade } from '../common/BlurFade';
+import { DoubanClient } from '../model/DoubanClient';
 import { ShareService } from '../common/ShareService';
 import { ShareTarget } from '../common/ShareLink';
 import { common } from '@kit.AbilityKit';
+import { curves, display } from '@kit.ArkUI';
 
 /** 封面尺寸（vp）：进度条要严格按这个宽度画，所以提成常量共用 */
 const COVER_W: number = 112;
 const COVER_H: number = 158;
+/** 简介折叠线：超过这个行数才折叠（字号 15 / 行高 24 与渲染处保持一致） */
+const DESC_MAX_LINES: number = 3;
+const DESC_LINE_H: number = 24;
+const DESC_FONT: number = 15;
 
 export interface DetailPageParam {
   sourceKey: string;
@@ -63,6 +69,11 @@ export struct DetailPage {
   @State speedItems: SpeedTestItem[] = [];
   @State speedTesting: boolean = false;
   @State showSpeedPanel: boolean = false;
+  /** 详情页评分：源站分数先顶上，豆瓣结果到了再覆盖 */
+  @State infoScore: string = '';
+  @State infoScoreFrom: string = '';
+  /** 折叠态下简介是否真的超出 3 行（只有超了才给「展开」） */
+  @State descOverflow: boolean = false;
 
   aboutToAppear(): void {
     this.favorite = HistoryStore.shared().isFavorite(this.sourceKey, this.vodId);
@@ -89,6 +100,9 @@ export struct DetailPage {
     this.currentLine = 0;
     this.currentEp = 0;
     this.descExpanded = false;
+    this.descOverflow = false;
+    this.infoScore = '';
+    this.infoScoreFrom = '';
     this.progress = null;
     this.speedItems = [];
     this.speedTesting = false;
@@ -128,6 +142,30 @@ export struct DetailPage {
     this.episodes = detail.episodes;
     this.lines = detail.info.lines !== undefined ? detail.info.lines : [];
     this.currentLine = 0;
+    // 换片必须把折叠态复位，否则上一部的「已展开」会带过来
+    this.descExpanded = false;
+    this.descOverflow = this.descOverflowFor(this.infoDesc);
+    // 评分：源站分数当占位，豆瓣的异步结果到了再覆盖（豆瓣更权威）
+    const rawScore = detail.info.score !== undefined ? detail.info.score.trim() : '';
+    const parsed = Number.parseFloat(rawScore);
+    if (rawScore !== '' && !Number.isNaN(parsed) && parsed > 0) {
+      this.infoScore = rawScore;
+      this.infoScoreFrom = '源站';
+    } else {
+      this.infoScore = '';
+      this.infoScoreFrom = '';
+    }
+    this.fetchDoubanRating(detail.info.title, this.infoYear);
+  }
+
+  /** 静默拉豆瓣评分：失败就当没有，绝不 toast、不阻塞页面 */
+  private async fetchDoubanRating(title: string, year: string): Promise<void> {
+    const score = await DoubanClient.ratingOf(title, year);
+    // 期间可能已经切到别的片子了，标题对不上就丢掉这次结果
+    if (score !== '' && this.infoTitle === title) {
+      this.infoScore = score;
+      this.infoScoreFrom = '豆瓣';
+    }
   }
 
   private async loadDetail(sourceKey: string, vodId: string): Promise<void> {
@@ -286,6 +324,7 @@ export struct DetailPage {
     }
     const epName: string = this.episodes.length > this.currentEp
       ? this.episodes[this.currentEp].name : '';
+    const brand: string = ShareService.brandName(ctx);
     const t: ShareTarget = {
       sourceKey: this.sourceKey,
       vodId: this.vodId,
@@ -295,8 +334,8 @@ export struct DetailPage {
       pic: this.infoCover
     };
     const desc: string = epName !== ''
-      ? ('正在看 ' + epName + ' · 来自 LibreTV')
-      : '来自 LibreTV';
+      ? ('正在看 ' + epName + (brand !== '' ? ' · 来自 ' + brand : ''))
+      : brand;
     ShareService.shareMovie(ctx, t, desc).then((ok: boolean) => {
       if (!ok) {
         this.toast('当前系统不支持系统分享');
@@ -334,7 +373,56 @@ export struct DetailPage {
     if (this.descExpanded) {
       return 100;
     }
-    return 3;
+    return DESC_MAX_LINES;
+  }
+
+  /**
+   * 简介在折叠线内放得下吗？
+   *
+   * 这套 SDK 的 Text 没有 onTextLayout 之类的布局回调，量不到「到底折了几行」，
+   * 所以用 measureTextSize 按真实可用宽度 + 真实字号/行高量一次：
+   * 量出来不超过 3 行就完全不折叠，也不显示「展开」——短简介不该让人多点一次。
+   * 任何一步失败都返回 true（保守折叠），保证长简介不会被截断且无处展开。
+   */
+  private descOverflowFor(text: string): boolean {
+    if (text === '') {
+      return false;
+    }
+    let width: number = 0;
+    try {
+      width = px2vp(display.getDefaultDisplaySync().width) - 32;
+    } catch (e) {
+      return true;
+    }
+    if (width <= 0) {
+      return true;
+    }
+    try {
+      const size = this.getUIContext().getMeasureUtils().measureTextSize({
+        textContent: text,
+        constraintWidth: width,
+        fontSize: DESC_FONT,
+        lineHeight: DESC_LINE_H
+      });
+      const hv = size.height;
+      let h: number = 0;
+      if (typeof hv === 'number') {
+        h = hv;
+      } else if (typeof hv === 'string') {
+        h = Number.parseFloat(hv);
+      }
+      if (Number.isNaN(h) || h <= 0) {
+        return true;
+      }
+      return h > DESC_LINE_H * DESC_MAX_LINES + 1;
+    } catch (e) {
+      return true;
+    }
+  }
+
+  /** 简介够短就完全不折叠：只有真的超过 3 行才需要这个开关 */
+  private descClamped(): boolean {
+    return this.descOverflow;
   }
 
   private descToggleLabel(): string {
@@ -369,8 +457,7 @@ export struct DetailPage {
   build() {
     NavDestination() {
       Stack({ alignContent: Alignment.Top }) {
-        // 内容层铺满整屏，滚动内容会从下方玻璃导航条背后穿过
-      Stack({ alignContent: Alignment.Bottom }) {
+            Stack({ alignContent: Alignment.Bottom }) {
         if (this.loading) {
           LoadingView()
         } else if (!this.ready) {
@@ -504,9 +591,8 @@ export struct DetailPage {
         .width('100%')
         .height(48 + SystemInsets.top())
         .padding({ left: 8, right: 16, top: SystemInsets.top() })
-        .backgroundColor($r('app.color.color_nav_glass'))
-        .backgroundEffect({ radius: 18, saturation: 1.6 })
-        .border({ width: { bottom: 1 }, color: $r('app.color.color_nav_border') })
+        // 不加底色/磨砂/描边：标题栏和页面渐变同源，往下滚动的内容由上面的
+        // BlurFade 虚化，这样顶部与内容区是同一块背景，看不到任何分界线。
       }
       .width('100%')
       .height('100%')
@@ -590,6 +676,23 @@ export struct DetailPage {
               .textOverflow({ overflow: TextOverflow.Ellipsis })
               .textAlign(TextAlign.Start)
               .width('100%')
+            if (this.infoScore !== '') {
+              Row({ space: 3 }) {
+                Text(this.infoScore)
+                  .fontSize(19)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor($r('app.color.color_primary'))
+                Text('分')
+                  .fontSize(11)
+                  .fontColor($r('app.color.color_primary'))
+                  .margin({ bottom: 2 })
+                Text(this.infoScoreFrom)
+                  .fontSize(11)
+                  .fontColor($r('app.color.color_text_secondary'))
+                  .margin({ left: 3, bottom: 2 })
+              }
+              .width('100%')
+            }
             Row({ space: 6 }) {
               if (this.infoYear !== '') {
                 TagText({ tagText: this.infoYear })
@@ -695,22 +798,6 @@ export struct DetailPage {
             this.runSpeedTest();
           })
 
-          Button() {
-            // 这张资源实际是「箭头朝上 + 底线」的上传图形，
-            // 下载按钮需要箭头朝下，直接旋转 180° 即可（同一份资源镜像成立）。
-            Image($r('app.media.ic_download'))
-              .width(20)
-              .height(20)
-              .rotate({ angle: 180 })
-          }
-          .width(42)
-          .height(42)
-          .backgroundColor($r('app.color.color_glass'))
-          .borderRadius(21)
-          .onClick(() => {
-            this.downloadCurrent();
-          })
-
           // 分享：拉起系统分享面板（带封面缩略图的 libretv:// 链接）。
           // 面板里同时有「碰一碰」入口，对方的设备贴一下就过去了。
           Button() {
@@ -731,23 +818,28 @@ export struct DetailPage {
 
         // 简介
         if (this.infoDesc !== '') {
-          Column({ space: 4 }) {
+          Column({ space: 6 }) {
             Text(this.infoDesc)
-              .fontSize(13)
+              // 字号/行高必须和 descOverflowFor() 里的量尺一致，否则量出来的
+              // 「放不放得下」和实际渲染对不上
+              .fontSize(DESC_FONT)
+              .lineHeight(DESC_LINE_H)
               .fontColor($r('app.color.color_text_secondary'))
               .maxLines(this.descMaxLines())
               .textOverflow({ overflow: TextOverflow.Ellipsis })
               .textAlign(TextAlign.Start)
               .width('100%')
               .copyOption(CopyOptions.LocalDevice)
-            Text(this.descToggleLabel())
-              .fontSize(12)
-              .fontColor($r('app.color.color_primary'))
-              .width('100%')
-              .textAlign(TextAlign.RIGHT)
-              .onClick(() => {
-                this.descExpanded = !this.descExpanded;
-              })
+            if (this.descClamped()) {
+              Text(this.descToggleLabel())
+                .fontSize(13)
+                .fontColor($r('app.color.color_primary'))
+                .width('100%')
+                .textAlign(TextAlign.RIGHT)
+                .onClick(() => {
+                  this.descExpanded = !this.descExpanded;
+                })
+            }
           }
           .width('100%')
           .padding({ left: 16, right: 16 })
@@ -756,32 +848,39 @@ export struct DetailPage {
 
         // 播放线路（源站返回多条线路时才显示）
         if (this.lines.length > 1) {
-          Column({ space: 8 }) {
+          Column({ space: 0 }) {
             Text('播放线路')
               .fontSize(15)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.color_text'))
               .textAlign(TextAlign.Start)
               .width('100%')
-            Scroll() {
-              Row({ space: 8 }) {
-                ForEach(this.lines, (line: PlayLine, idx: number) => {
-                  Text(line.name + '（' + line.episodes.length + '集）')
-                    .fontSize(13)
-                    .fontColor(idx === this.currentLine ? Color.White : $r('app.color.color_text'))
-                    .backgroundColor(idx === this.currentLine
-                      ? $r('app.color.color_primary')
-                      : $r('app.color.color_chip_bg'))
-                    .borderRadius(14)
-                    .padding({ left: 12, right: 12, top: 6, bottom: 6 })
-                    .onClick(() => {
-                      this.selectLine(idx);
-                    })
-                }, (line: PlayLine, idx: number) => idx.toString() + '_' + line.name)
-              }
+              // Flex 换行没有行间距属性，间距全靠按钮自己的 margin，
+              // 标题这里补一格，别和第一排按钮贴死。
+              .margin({ bottom: 8 })
+            // 用换行 Flex 而不是横向 Scroll：Scroll 会把「内容比视口窄」的子节点
+            // 居中摆（默认对齐是 Center），线路少的时候整排按钮就飘到中间去了。
+            // Flex 换行天然左对齐，也不需要额外的对齐属性。
+            Flex({ wrap: FlexWrap.Wrap }) {
+              ForEach(this.lines, (line: PlayLine, idx: number) => {
+                Text(line.name)
+                  .fontSize(13)
+                  .height(36)
+                  .borderRadius(8)
+                  .padding({ left: 16, right: 16 })
+                  .textAlign(TextAlign.Center)
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .fontColor(idx === this.currentLine ? Color.White : $r('app.color.color_text'))
+                  .backgroundColor(idx === this.currentLine
+                    ? $r('app.color.color_primary')
+                    : $r('app.color.color_chip_bg'))
+                  .margin({ right: 8, bottom: 8 })
+                  .onClick(() => {
+                    this.selectLine(idx);
+                  })
+              }, (line: PlayLine, idx: number) => idx.toString() + '_' + line.name)
             }
-            .scrollable(ScrollDirection.Horizontal)
-            .scrollBar(BarState.Off)
             .width('100%')
           }
           .width('100%')
@@ -823,8 +922,33 @@ export struct DetailPage {
           .rowsGap(8)
           .width('100%')
         }
-        .padding({ left: 16, right: 16, bottom: 24 })
+        .padding({ left: 16, right: 16, bottom: 16 })
         .alignItems(HorizontalAlign.Start)
+
+        // 下载单独一行，居中放在选集下方。
+        // 尺寸/圆角/字号对齐上面的「续播」按钮（42 高 / 21 圆角 / 15sp 白字），
+        // 只把底色换成蓝色 —— 红色是「立刻播」的主操作，下载是次要动作，
+        // 靠颜色区分，别让两颗大红按钮抢视线。
+        // 标题只留文字、不带图标：ic_download 那张图其实是「箭头朝上 + 底线」
+        // 的上传图形，之前靠 rotate(180°) 硬凑成下载，越小越像上传，干脆去掉。
+        // 宽度给死 160 而不是 layoutWeight(1)：居中的按钮撑满整行就不叫居中了。
+        Row() {
+          Button() {
+            Text('下载离线观看')
+              .fontSize(15)
+              .fontColor(Color.White)
+          }
+          .width(160)
+          .height(42)
+          .backgroundColor($r('app.color.color_download'))
+          .borderRadius(21)
+          .onClick(() => {
+            this.downloadCurrent();
+          })
+        }
+        .width('100%')
+        .justifyContent(FlexAlign.Center)
+        .padding({ left: 16, right: 16, top: 4, bottom: 28 })
       }
       .width('100%')
       // 关键：内容不满一屏时 Scroll 会把子内容垂直居中（实测 Column 落在 y=834，

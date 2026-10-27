@@ -1,11 +1,12 @@
-/**
+﻿/**
  * 播放页：全屏播放（点播 / 离线缓存）、进度续播、倍速、选集、换源、自动连播
  */
 
 import { fileIo as fs } from '@kit.CoreFileKit';
-import { window, PiPWindow } from '@kit.ArkUI';
+import { window, PiPWindow, curves } from '@kit.ArkUI';
 import { AvPlayerController, PlaybackSpeedOption } from '../player/AvPlayerController';
 import { DevicePolicy } from '../common/DevicePolicy';
+import { SystemInsets } from '../common/SystemInsets';
 import { audio, AVVolumePanel } from '@kit.AudioKit';
 import { AVCastPicker, AVCastPickerStyle, AVCastPickerColorMode, avSession } from '@kit.AVSessionKit';
 import { ScreenKeeper } from '../common/ScreenKeeper';
@@ -24,7 +25,6 @@ import { LocalHttpServer } from '../common/LocalHttpServer';
 import { NavIds } from '../common/NavIds';
 import { AppLifecycle } from '../common/AppLifecycle';
 import { Brand } from '../common/Brand';
-import { GlassMaterial } from '../common/GlassMaterial';
 import { latestNavParam } from '../common/NavParam';
 import { ShareService } from '../common/ShareService';
 import { ShareTarget } from '../common/ShareLink';
@@ -46,6 +46,9 @@ export interface PlayerPageParam {
   /** 播放线路下标；详情页选了非默认线路时传入 */
   lineIndex?: number;
 }
+
+/** 竖屏时控制条与画面下沿之间留的空隙（vp） */
+const PLAYER_BAR_GAP: number = 10;
 
 @Component
 export struct PlayerPage {
@@ -115,9 +118,21 @@ export struct PlayerPage {
   @State speedTesting: boolean = false;
   @State speedValue: number = 1.0;
   @State landscape: boolean = false;
+  /**
+   * 顶部操作栏的让位量（vp）。手机 42（状态栏 38 + 4），平板按实测放大，
+   * 横屏无状态栏时回到 8。见 syncTopPad()。
+   */
+  @State topPadVp: number = SystemInsets.top() + 8;
+
   /** 视频真实分辨率（由 AVPlayer 的 videoSizeChange 上报） */
   @State videoW: number = 0;
   @State videoH: number = 0;
+  /**
+   * 底部控制条高度（vp）。初值给 66（24 的进度条 + 28 的按钮行 + 上下内边距），
+   * 和实测基本一致；首帧就按这个值算抬升量，不会先跳一下再归位，
+   * 之后由 onAreaChange 校正成真值。
+   */
+  @State barH: number = 66;
   /** 播放器可视区域（vp），由根容器 onAreaChange 实测得到 */
   @State canvasW: number = 0;
   @State canvasH: number = 0;
@@ -172,6 +187,20 @@ export struct PlayerPage {
   private static readonly STALL_LIMIT: number = 3;
   /** 一次播放最多自动换几次源，超了就交回给用户 */
   private static readonly AUTO_SWITCH_MAX: number = 3;
+
+  // ---------- 弱网自适应（网络越差，越晚才判「加载失败 / 该换源」）----------
+  /**
+   * 弱网档位：0 正常 / 1 偏弱 / 2 弱网。只升不降，
+   * 直到「连续平稳播放 60 秒」才回落一档 —— 抖一下就永久放宽阈值，
+   * 等于把正常的换源保护也一起废掉。
+   */
+  private netLevel: number = 0;
+  /** 本轮起播的开始时刻（0 = 没在计时）：用来算「多久才出画面」 */
+  private loadStartedAt: number = 0;
+  /** 最近一次测到的起播耗时（ms），排查时看日志用 */
+  private lastStartCostMs: number = 0;
+  /** 弱网提示文案：起播期间给用户一句「为什么这么久」 */
+  private static readonly WEAK_HINT: string = '网络较慢，正在加大缓冲等待…';
   /** 自动换源的过程提示：写在加载圈下面，不用 toast ——
    *  测速那几秒画面可能自己就恢复了，弹一条转瞬即逝的 toast 看着像误报 */
   @State loadingHint: string = '';
@@ -238,6 +267,8 @@ export struct PlayerPage {
   private screenHeld: boolean = false;
 
   aboutToAppear(): void {
+    // 先把顶部栏的让位量校准（缓存节点复用时靠 onShown 里的再次调用）
+    this.syncTopPad();
     // 播放页存活期间保持屏幕常亮：平板全屏播放时系统休眠计时一到会直接黑屏锁屏
     this.holdScreen();
     this.syncSystemVolume();
@@ -502,6 +533,10 @@ export struct PlayerPage {
         // 否则一小时里零散卡三次也会被判成「反复卡顿」而换源。
         if (this.stallCount > 0 && this.lastStallAt > 0 && this.lastProgressAt - this.lastStallAt > 60000) {
           this.stallCount = 0;
+          // 平稳一分钟：弱网档位退一档，别让阈值永久停在放宽状态
+          if (this.netLevel > 0) {
+            this.netLevel = this.netLevel - 1;
+          }
         }
         if (this.stallTimer >= 0 || this.stallLoading) {
           this.clearStall();
@@ -522,6 +557,14 @@ export struct PlayerPage {
       this.showLoading = false;
       this.clearLoadingTimer();
       if (playing) {
+        // 结算起播耗时（必须在置 hasStarted 之前算，这里只是顺序清楚）
+        if (this.loadStartedAt > 0) {
+          this.noteStartCost(Date.now() - this.loadStartedAt);
+          this.loadStartedAt = 0;
+        }
+        if (this.loadingHint === PlayerPage.WEAK_HINT) {
+          this.loadingHint = '';
+        }
         this.hasStarted = true;
         this.clearStall();
         this.clearWatchdog();
@@ -562,6 +605,10 @@ export struct PlayerPage {
       }
       if (!this.hasStarted) {
         this.showLoading = true;
+        // 已经判定弱网：把话说清楚，否则用户只看得到转圈，以为是卡死
+        if (this.netLevel > 0) {
+          this.loadingHint = PlayerPage.WEAK_HINT;
+        }
         return;
       }
       // 起播后的卡顿检测：缓冲事件只做「预约」，进度真的停住 ~1 秒才弹加载圈。
@@ -654,16 +701,21 @@ export struct PlayerPage {
       if (this.released || !this.hasStarted) {
         return;
       }
-      if (Date.now() - this.lastPosAt >= 900) {
+      if (Date.now() - this.lastPosAt >= this.stallIdleMs()) {
         this.stallLoading = true;
         this.stallCount++;
         this.lastStallAt = Date.now();
-        // 同一集反复卡 3 次以上：别让用户一直盯着转圈，换延时最小的源
-        if (this.stallCount >= PlayerPage.STALL_LIMIT) {
+        // 同一集卡到第二次：网络明显在抖，先把档位抬一档，
+        // 后面几次的判定自然放宽（这一轮不会再触发换源）
+        if (this.stallCount >= 2 && this.netLevel < 1) {
+          this.netLevel = 1;
+        }
+        // 同一集反复卡到档位上限（3 / 4 / 6 次）：别再让用户盯着转圈，换延时最小的源
+        if (this.stallCount >= this.stallLimit()) {
           this.onPlaybackHang();
         }
       }
-    }, 1000);
+    }, this.stallProbeDelayMs());
   }
 
   private clearStall(): void {
@@ -913,6 +965,8 @@ export struct PlayerPage {
     this.resyncCount = 0;
     this.clearResync();
     this.clearWatchdog();
+    // 起播计时：到第一次 playing 时算差值，用来判断「这一路是不是本来就慢」
+    this.loadStartedAt = Date.now();
     // 离线播放只有本地一份文件，没有别的源可换，不必起表
     if (this.offlineDir === '') {
       this.startWatchdog();
@@ -1014,6 +1068,8 @@ export struct PlayerPage {
       this.toast('无法调起系统分享');
       return;
     }
+    const brand: string = ShareService.brandName(ctx);
+    const suffix: string = brand !== '' ? (' · 来自 ' + brand) : '';
     const pic: string | undefined = this.resolvePic();
     const t: ShareTarget = {
       sourceKey: this.sourceKey,
@@ -1024,7 +1080,7 @@ export struct PlayerPage {
       pic: pic !== undefined ? pic : ''
     };
     ShareService.shareMovie(ctx, t,
-      this.episodeName !== '' ? ('正在看 ' + this.episodeName + ' · 来自 LibreTV') : '来自 LibreTV')
+      this.episodeName !== '' ? ('正在看 ' + this.episodeName + suffix) : brand)
       .then((ok: boolean) => {
         if (!ok) {
           this.toast('当前系统不支持系统分享');
@@ -1079,6 +1135,48 @@ export struct PlayerPage {
       durationMs: dur,
       updatedAt: Date.now()
     });
+  }
+
+  /** 控制条四角：横屏贴底只圆上沿，竖屏浮起来四角都圆 */
+  private barRadius(): BorderRadiuses {
+    if (this.landscape) {
+      return { topLeft: 24, topRight: 24, bottomLeft: 0, bottomRight: 0 };
+    }
+    return { topLeft: 20, topRight: 20, bottomLeft: 20, bottomRight: 20 };
+  }
+
+  /**
+   * 底部控制条要离屏幕底边多远（vp）。
+   *
+   * 竖屏（非全屏）时画面是居中的一条，整块屏幕下半截都是黑的：控制条如果照旧
+   * 贴底，既离画面老远，又正好压在最容易误触的手势条上。这里把它抬到
+   * 「画面下沿再往下 PLAYER_BAR_GAP」—— 压不到画面，也不用伸到屏幕最底下。
+   * 横屏画面铺满，算出来是负数，一律归零，保持原来贴底的全屏观感。
+   */
+  private playerBarLift(): number {
+    if (this.landscape || this.canvasH <= 0 || this.displayH <= 0) {
+      return 0;
+    }
+    const videoBottom: number = (this.canvasH + this.displayH) / 2;
+    const lift: number = this.canvasH - videoBottom - PLAYER_BAR_GAP - this.barH;
+    if (lift > 0) {
+      return lift;
+    }
+    return 0;
+  }
+
+  /** onAreaChange 的尺寸可能是数字也可能是 '66.00vp' 这样的字符串 */
+  private captureBarHeight(area: Area): void {
+    const hv = area.height;
+    let h: number = 0;
+    if (typeof hv === 'number') {
+      h = hv;
+    } else if (typeof hv === 'string') {
+      h = Number.parseFloat(hv);
+    }
+    if (!Number.isNaN(h) && h > 0 && Math.abs(h - this.barH) > 0.5) {
+      this.barH = h;
+    }
   }
 
   private release(): void {
@@ -1318,7 +1416,81 @@ export struct PlayerPage {
     return false;
   }
 
-  /** 起播看门狗：12 秒还没出画面，就当这一路加载失败 */
+  /**
+   * 起播超时：弱网下 12 秒根本不够。
+   * 实测弱 4G 起播常在 15~25 秒；按 12 秒判死会「明明能播却一直换源」，
+   * 而每换一次都要重新拉详情 + 测速 + 解析地址，用户看到的是无休止的转圈。
+   */
+  private loadTimeoutMs(): number {
+    if (this.netLevel >= 2) {
+      return 32000;
+    }
+    if (this.netLevel === 1) {
+      return 20000;
+    }
+    return PlayerPage.LOAD_TIMEOUT_MS;
+  }
+
+  /** 卡顿探针等多久再查进度：先给缓冲一点时间，别拿正常的缓冲尖峰当卡顿 */
+  private stallProbeDelayMs(): number {
+    if (this.netLevel >= 2) {
+      return 2200;
+    }
+    if (this.netLevel === 1) {
+      return 1600;
+    }
+    return 1000;
+  }
+
+  /** 进度停摆多久才算真的卡住（弱网下进度本来就是一顿一顿的） */
+  private stallIdleMs(): number {
+    if (this.netLevel >= 2) {
+      return 2000;
+    }
+    if (this.netLevel === 1) {
+      return 1400;
+    }
+    return 900;
+  }
+
+  /** 同一集卡几次才自动换源：弱网下把账放宽，别卡两下就跳走 */
+  private stallLimit(): number {
+    if (this.netLevel >= 2) {
+      return 6;
+    }
+    if (this.netLevel === 1) {
+      return 4;
+    }
+    return PlayerPage.STALL_LIMIT;
+  }
+
+  /**
+   * 「进度刚刚还在走」的判定窗。
+   * onPlaybackHang 里三处都用它：窗口内还动过，就不许换源。
+   * 弱网下进度天生一跳一跳（缓冲一段走一段），窗口必须比正常宽，
+   * 否则每次都在「刚缓过来」的瞬间被判成卡死。
+   */
+  private healthyWindowMs(): number {
+    if (this.netLevel >= 2) {
+      return 8000;
+    }
+    if (this.netLevel === 1) {
+      return 5000;
+    }
+    return 3000;
+  }
+
+  /** 记录一次真实起播耗时，据此抬高弱网档位 */
+  private noteStartCost(costMs: number): void {
+    this.lastStartCostMs = costMs;
+    if (costMs >= 12000) {
+      this.netLevel = 2;
+    } else if (costMs >= 6000 && this.netLevel < 1) {
+      this.netLevel = 1;
+    }
+  }
+
+  /** 起播看门狗：默认 12 秒，弱网按档位放宽到 20 / 32 秒 */
   private startWatchdog(): void {
     this.clearWatchdog();
     this.loadWatchdog = setTimeout(() => {
@@ -1327,7 +1499,7 @@ export struct PlayerPage {
         return;
       }
       this.onPlaybackHang();
-    }, PlayerPage.LOAD_TIMEOUT_MS);
+    }, this.loadTimeoutMs());
   }
 
   private clearWatchdog(): void {
@@ -1348,7 +1520,7 @@ export struct PlayerPage {
     // 近 3 秒内进度还在走 = 播放正常，别换源。
     // 判据用「进度」而不是 playing：卡顿时 playing 依然为 true。
     // 1.5 秒太短：缓冲刚恢复的那一下进度会跳一格，还是会被判成「已经卡住」。
-    if (this.lastProgressAt > 0 && Date.now() - this.lastProgressAt < 3000) {
+    if (this.lastProgressAt > 0 && Date.now() - this.lastProgressAt < this.healthyWindowMs()) {
       return;
     }
     this.showLoading = false;
@@ -1389,7 +1561,7 @@ export struct PlayerPage {
         return;
       }
       // 测速期间画面已恢复就不再切：这一步是「误切」唯一的拦截点
-      if (this.lastProgressAt > 0 && Date.now() - this.lastProgressAt < 3000) {
+      if (this.lastProgressAt > 0 && Date.now() - this.lastProgressAt < this.healthyWindowMs()) {
         this.loadingHint = '';
         this.showLoading = false;
         return;
@@ -1417,7 +1589,7 @@ export struct PlayerPage {
       let switchedName: string = '';
       for (const c of candidates) {
         // 每个候选源动手前再确认一次——找源、拉详情都已花掉好几秒
-        if (this.lastProgressAt > 0 && Date.now() - this.lastProgressAt < 3000) {
+        if (this.lastProgressAt > 0 && Date.now() - this.lastProgressAt < this.healthyWindowMs()) {
           this.loadingHint = '';
           this.showLoading = false;
           return;
@@ -1720,6 +1892,11 @@ export struct PlayerPage {
 
   private setLandscape(on: boolean): void {
     this.landscape = on;
+    // 方向一变，状态栏可能整条出现或收起：先测一次，转完（系统异步）再补一次
+    this.syncTopPad();
+    setTimeout(() => {
+      this.syncTopPad();
+    }, 500);
     const context = this.getUIContext().getHostContext();
     if (context === undefined) {
       return;
@@ -1738,6 +1915,30 @@ export struct PlayerPage {
     }).catch(() => {
       // 忽略窗口操作失败
     });
+  }
+
+  /**
+   * 顶部操作栏让位：读窗口真实的状态栏占位，不再写死 42vp。
+   *
+   * 写死 42 只在手机上对（状态栏 38 + 4）；平板状态栏更高，
+   * 全屏播放时收藏、分享这一排会压在时间与电量上。横屏时系统若把状态栏
+   * 收起来（实测 0），退到 8，与改之前的表现一致。
+   */
+  private syncTopPad(): void {
+    const measured: number = SystemInsets.measureTopVp(DevicePolicy.currentWindow());
+    if (measured < 0) {
+      return;
+    }
+    // 20vp 以下有两种情况：横屏时是真的没有状态栏（贴边 8 即可）；
+    // 竖屏则多半是窗口刚创建、量到的是半个值 —— 退回旧的保守值 42，
+    // 宁可多留一点也不要把时间、电量压在图标底下。
+    let pad: number = this.landscape ? 8 : 48;
+    if (measured >= 20) {
+      pad = measured + 8;
+    }
+    if (pad !== this.topPadVp) {
+      this.topPadVp = pad;
+    }
   }
 
   /**
@@ -1769,6 +1970,9 @@ export struct PlayerPage {
   build() {
     NavDestination() {
       Stack({ alignContent: Alignment.Center }) {
+        // ── 指光：跟着手指走的柔光 ──────────────────────────────────────
+        // 系统材质对页面内容区的按钮不生效（作用域限制），
+        // 这层光是自己画的：按下哪个按钮，光就落在那儿并跟着手走。
         // 视频画面：尺寸由 updateSurfaceSize 按原始宽高比算出，Stack 负责居中
         VideoSurface({
           // 控制器由页面持有：创建画中画时必须把它交给 PiPWindow，
@@ -1978,7 +2182,7 @@ export struct PlayerPage {
             // 竖屏：进播放页同样会切窗口全屏（applyWindowFullScreen(true)），
             // 页面从 y=0 开始画，状态栏是透明浮在上面的 —— 这里必须让开
             // 一个状态栏的高度，否则片名和返回键直接压在时间/电量上。
-            .padding({ left: 14, right: 14, top: this.landscape ? 8 : 42 })
+            .padding({ left: 20, right: 20, top: this.topPadVp, bottom: 4 })
             // 方案 D：顶部操作栏同样是玻璃，但底色要压得比底部重 ——
             // 它压在最亮的画面上，纯玻璃会让白字糊掉；下沿圆角是为了
             // 让"这是一块玻璃"这件事在实机上一眼看得出来（通栏矩形太像旧版）。
@@ -1986,43 +2190,11 @@ export struct PlayerPage {
             .backgroundEffect({ radius: 20, saturation: 1.4 })
             .borderRadius({ bottomLeft: 22, bottomRight: 22 })
 
-            // 中部播放按钮：只在「已经起播过、现在处于暂停」时出现。
-            // 起播前的加载阶段画面中央不该有三角，否则看着像没自动播放。
-            Row() {
-              if (this.playing) {
-                Stack({ alignContent: Alignment.Center }) {
-                  Image($r('app.media.ic_player_pause'))
-                    .width(30)
-                    .height(30)
-                    .fillColor($r('app.color.color_text'))
-                }
-                .width(62)
-                .height(62)
-                .borderRadius(31)
-                .backgroundColor($r('app.color.color_player_scrim'))
-                .onClick(() => {
-                  this.togglePlay();
-                })
-              } else if (this.hasStarted && this.errorText === '') {
-                Stack({ alignContent: Alignment.Center }) {
-                  Image($r('app.media.ic_player_play'))
-                    .width(30)
-                    .height(30)
-                    .fillColor($r('app.color.color_text'))
-                    .margin({ left: 4 })
-                }
-                .width(62)
-                .height(62)
-                .borderRadius(31)
-                .backgroundColor($r('app.color.color_player_scrim'))
-                .onClick(() => {
-                  this.togglePlay();
-                })
-              }
-            }
-            .width('100%')
-            .layoutWeight(1)
-            .justifyContent(FlexAlign.Center)
+            // 这里只留空白撑高，把底部控制条顶到最下面。
+            // 播放/暂停按钮不能留在这条 Column 里：竖屏时控制条会被抬到画面下方，
+            // 靠 layoutWeight 居中的按钮会跟着被挤到画面上三分之一处。
+            // 它现在挂在 Stack 上单独居中（见下面的「中部播放按钮」）。
+            Blank()
 
             // 底部控制条
             // 进度条与功能按钮之间不再留 4vp 的气口：Slider 自身在 OutSet 样式下
@@ -2161,14 +2333,32 @@ export struct PlayerPage {
             // 方案 D：播放页控制条用液态玻璃（薄材质 + 自动互补色 + 按压形变 + 光随指动）
             // 底色不能用 color_panel_glass：那是跟随主题的"浅玻璃"，深色主题下是 20% 白，
             // 压到画面上会把画面提亮，白字反而更糊。播放页永远压着视频，固定用深色底。
-            .backgroundColor('#4D000000')
+            // 竖屏（非全屏）时这块玻璃会被抬到画面下方，悬在黑底上 ——
+            // 35% 黑在纯黑背景里等于隐形，所以换成一档浅一点的深灰；
+            // 横屏画面铺满、控制条贴底，仍用原来那条压暗玻璃。
+            .backgroundColor(this.landscape ? '#4D000000' : '#26FFFFFF')
             .backgroundEffect({ radius: 26, saturation: 1.5 })
-            .systemMaterial(GlassMaterial.supported ? GlassMaterial.liquid : undefined)
             // 上沿大圆角：通栏色带在实机上和旧版的黑色压暗条几乎分不出来，
             // 圆角边界才能被眼睛抓到，玻璃块感才立得住。
             // 不画描边：这条玻璃已经贴到屏幕底边，四边描边会在下方多出一条
             // 横线（用户明确要求去掉），只靠圆角 + 亮度差表达边界。
-            .borderRadius({ topLeft: 24, topRight: 24 })
+            .borderRadius(this.barRadius())
+            // 竖屏：抬起来当独立卡片 —— 左右留边、四角全圆、描边 + 投影托住
+            .margin({
+              left: this.landscape ? 0 : 12,
+              right: this.landscape ? 0 : 12,
+              bottom: this.playerBarLift()
+            })
+            .border({ width: this.landscape ? 0 : 1, color: '#1FFFFFFF' })
+            .shadow({
+              radius: this.landscape ? 0 : 22,
+              color: this.landscape ? '#00000000' : '#66000000',
+              offsetY: this.landscape ? 0 : 6
+            })
+            // 量一次自身高度：抬多高要用它反算（见 playerBarLift）
+            .onAreaChange((oldArea: Area, newArea: Area) => {
+              this.captureBarHeight(newArea);
+            })
           }
           .width('100%')
           .height('100%')
@@ -2176,6 +2366,26 @@ export struct PlayerPage {
           // 早先 top 26 / bottom 22 是为了避开状态栏和手势条，代价是顶部影片信息
           // 栏和底部控制条都"浮在离边一段距离的地方"，看着不像是全屏。
           .padding({ top: 0, bottom: 0 })
+        }
+
+        // 中部播放按钮：只在「已经起播过」时出现（加载阶段不该有三角，
+        // 否则看着像没自动播放）。放在 Stack 上由 alignContent 居中，
+        // 正好落在画面正中 —— 与底部控制条的位置解耦。
+        if (this.controlsVisible && this.errorText === '' && this.hasStarted) {
+          Stack({ alignContent: Alignment.Center }) {
+            Image(this.playing ? $r('app.media.ic_player_pause') : $r('app.media.ic_player_play'))
+              .width(30)
+              .height(30)
+              .fillColor($r('app.color.color_text'))
+              .margin({ left: this.playing ? 0 : 4 })
+          }
+          .width(62)
+          .height(62)
+          .borderRadius(31)
+          .backgroundColor($r('app.color.color_player_scrim'))
+          .onClick(() => {
+            this.togglePlay();
+          })
         }
 
         // 滑屏调节的浮层提示（音量改由系统音量面板呈现，这里只留亮度）
@@ -2441,6 +2651,7 @@ export struct PlayerPage {
     .hideBackButton(true)
     .onShown(() => {
       this.onPageShown();
+      this.syncTopPad();
     })
     .onBackPressed(() => {
       this.back();

@@ -9,7 +9,7 @@
  *
  * 用法：
  *   node scripts/package-release.js
- *   node scripts/package-release.js --desktop "D:\Users\PPLC\Desktop"
+ *   node scripts/package-release.js --desktop "C:\Users\<你的用户名>\Desktop"
  *
  * 前置：必须已经在「公开 / 脱敏」配置下构建过 —— 脚本会先自检，不合规直接中止：
  *   - build-profile.json5 里 signingConfigs 必须为空（不能带本机证书路径）
@@ -102,7 +102,7 @@ function assertHapClean(file, localBrand) {
  *   1. --desktop "<路径>"
  *   2. 环境变量 RELEASE_DESKTOP
  *   3. scripts/.release-desktop.json（本机配置，不进仓库）
- *      桌面被重定向到别的盘时（本机就是 D:\Users\PPLC\Desktop）用它最省事 ——
+ *      桌面被重定向到别的盘时用它最省事 ——
  *      USERPROFILE\Desktop 根本不存在，而读注册表要调 reg.exe，未必允许
  *   4. 常见的 Desktop / OneDrive\Desktop
  *   5. 注册表里的真实位置（reg.exe 被禁时会失败，失败就报错让用户显式指定）
@@ -131,7 +131,7 @@ function resolveDesktop(argv) {
       return c;
     }
   }
-  // 桌面被重定向到别的盘（本机就是 D:\Users\PPLC\Desktop）：问注册表
+  // 桌面被重定向到别的盘（USERPROFILE\Desktop 不存在）：问注册表
   try {
     const out = execSync(
       'reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders" /v Desktop',

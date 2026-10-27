@@ -1,10 +1,11 @@
-/**
+﻿/**
  * 直播播放页：M3U/FLV 直播流播放、节目单（EPG）、收藏
  * 直播流由 AVPlayer 原生刷新播放列表，不做本地重写
  */
 
-import { window, PiPWindow } from '@kit.ArkUI';
+import { window, PiPWindow, curves } from '@kit.ArkUI';
 import { DevicePolicy } from '../common/DevicePolicy';
+import { SystemInsets } from '../common/SystemInsets';
 import { ScreenKeeper } from '../common/ScreenKeeper';
 import { AvPlayerController } from '../player/AvPlayerController';
 import { PlayUrlResolver } from '../player/PlayUrlResolver';
@@ -94,6 +95,12 @@ export struct LivePlayerPage {
   @State epgNow: string = '';
   @State epgNext: string = '';
   @State landscape: boolean = false;
+  /**
+   * 顶部操作栏的让位量（vp）。手机 42（状态栏 38 + 4），平板按实测放大，
+   * 横屏无状态栏时回到 8。见 syncTopPad()。
+   */
+  @State topPadVp: number = SystemInsets.top() + 8;
+
   /** 直播流真实分辨率（AVPlayer videoSizeChange 上报） */
   @State videoW: number = 0;
   @State videoH: number = 0;
@@ -121,6 +128,8 @@ export struct LivePlayerPage {
   private progressSeen: boolean = false;
 
   aboutToAppear(): void {
+    // 顶部栏让位量按窗口实测（平板状态栏比手机高，写死 42 会压住时间/电量）
+    this.syncTopPad();
     // 播放页存活期间保持屏幕常亮：平板全屏播放时系统休眠计时一到会直接黑屏锁屏
     this.holdScreen();
     this.favorite = HistoryStore.shared().isLiveFavorite(this.channelUrl);
@@ -193,7 +202,33 @@ export struct LivePlayerPage {
    * 判据用 released：离开本页一定走 release()（back 与 aboutToDisappear 两条路都调），
    * 首次进入以及「从后台回前台」时 released 都是 false，不会被误判成再次进入。
    */
+  /**
+   * 顶部操作栏让位：读窗口真实的状态栏占位，不再写死 42vp。
+   *
+   * 写死 42 只在手机上对（状态栏 38 + 4）；平板状态栏更高，
+   * 全屏播放时收藏、分享这一排会压在时间与电量上。横屏时系统若把状态栏
+   * 收起来（实测 0），退到 8，与改之前的表现一致。
+   */
+  private syncTopPad(): void {
+    const measured: number = SystemInsets.measureTopVp(DevicePolicy.currentWindow());
+    if (measured < 0) {
+      return;
+    }
+    // 20vp 以下有两种情况：横屏时是真的没有状态栏（贴边 8 即可）；
+    // 竖屏则多半是窗口刚创建、量到的是半个值 —— 退回旧的保守值 42，
+    // 宁可多留一点也不要把时间、电量压在图标底下。
+    let pad: number = this.landscape ? 8 : 48;
+    if (measured >= 20) {
+      pad = measured + 8;
+    }
+    if (pad !== this.topPadVp) {
+      this.topPadVp = pad;
+    }
+  }
+
   private onPageShown(): void {
+    // 缓存节点复用：进页面时的实测值可能已经过期（比如刚从横屏回来）
+    this.syncTopPad();
     if (!this.released) {
       return;
     }
@@ -848,6 +883,11 @@ export struct LivePlayerPage {
 
   private setLandscape(on: boolean): void {
     this.landscape = on;
+    // 方向一变，状态栏可能整条出现或收起：先测一次，转完（系统异步）再补一次
+    this.syncTopPad();
+    setTimeout(() => {
+      this.syncTopPad();
+    }, 500);
     const context = this.getUIContext().getHostContext();
     if (context === undefined) {
       return;
@@ -907,6 +947,9 @@ export struct LivePlayerPage {
   build() {
     NavDestination() {
       Stack({ alignContent: Alignment.Center }) {
+        // ── 指光：跟着手指走的柔光 ──────────────────────────────────────
+        // 系统材质对页面内容区的按钮不生效（作用域限制），
+        // 这层光是自己画的：按下哪个按钮，光就落在那儿并跟着手走。
         // 画面尺寸由 updateSurfaceSize 按原始宽高比算出，居中的事交给外层 Stack
         VideoSurface({
           // 控制器由页面持有，创建画中画时要交给 PiPWindow
@@ -1068,7 +1111,7 @@ export struct LivePlayerPage {
             .width('100%')
             // 顶部栏位置与点播全屏页保持一致：横屏贴屏幕边缘 8vp
             // （原来固定 14 + 外层 26 = 40vp，横屏全屏下离顶边太远，比点播页低一大截）
-            .padding({ left: 14, right: 14, top: this.landscape ? 8 : 42 })
+            .padding({ left: 20, right: 20, top: this.topPadVp, bottom: 4 })
 
             // 中部按钮：加载阶段不显示三角，只有「起播过且当前暂停」才出现
             Row() {

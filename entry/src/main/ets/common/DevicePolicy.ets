@@ -87,6 +87,11 @@ export class DevicePolicy {
    * 而手机物理屏仍是竖屏；按物理屏判断会把方向锁死为竖屏，
    * 车机上就渲染成一块手机比例的小窗（本次反馈的现象）。
    */
+  /** 主窗口（EntryAbility 启动时 bind 进来）。量安全区、改方向都靠它 */
+  static currentWindow(): window.Window | null {
+    return DevicePolicy.win;
+  }
+
   static isWideDevice(): boolean {
     try {
       if (display.isFoldable()) {

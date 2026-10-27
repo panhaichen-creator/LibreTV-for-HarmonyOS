@@ -332,13 +332,14 @@ export struct SettingsRow {
   build() {
     Row({ space: 8 }) {
       Text(this.rowTitle)
-        .fontSize(15)
+        // 17 号字 + 上下 18 的内边距：整行高度约 60vp，手指点起来更稳
+        .fontSize(17)
         .fontColor(this.rowTitleColor)
         .layoutWeight(1)
         .textAlign(TextAlign.Start)
       if (this.rowValue !== '') {
         Text(this.rowValue)
-          .fontSize(13)
+          .fontSize(14)
           .fontColor($r('app.color.color_text_secondary'))
           .maxLines(1)
       }
@@ -351,7 +352,7 @@ export struct SettingsRow {
       }
     }
     .width('100%')
-    .padding({ left: 16, right: 16, top: 14, bottom: 14 })
+    .padding({ left: 18, right: 18, top: 18, bottom: 18 })
     .backgroundColor($r('app.color.color_card'))
     .onClick(() => {
       this.onRowClick();

@@ -3,7 +3,7 @@
 > 这份文档假设你**从没用过 Git**，也**没敲过命令行**。
 > 照着做就行：每一步都写清楚了「点哪里、看到什么、如果不对怎么办」。
 >
-> 适用仓库：`C:\Users\75148\WorkBuddy\2026-10-16-15-38-25\LibreTV-HarmonyOS`
+> 适用仓库：`<你的本地仓库目录>\LibreTV-HarmonyOS`
 
 ---
 
@@ -67,7 +67,7 @@
 2. 点 **Choose…**，选中这个文件夹：
 
    ```
-   C:\Users\75148\WorkBuddy\2026-10-16-15-38-25\LibreTV-HarmonyOS
+   <你的本地仓库目录>\LibreTV-HarmonyOS
    ```
 
    ⚠️ **必须选到 `LibreTV-HarmonyOS` 这一层**。选到它的上一层（`2026-10-16-15-38-25`）会认不出来，
@@ -117,11 +117,12 @@
 | `.ohos/`、`*.p12`、`*.cer`、`*.p7b` | 签名证书本体 |
 | `dev/` 目录 | 本机调试脚本、截图、体检报告 |
 | `entry/build/`、`*.hap` | 打包产物，几十 MB，没意义 |
+| 应用图标里的品牌字母 | 图片**扫不出来**，只能人眼看。仓库自带的是通用播放图标 |
 
 **操作**：双击这个文件
 
 ```
-C:\Users\75148\WorkBuddy\2026-10-16-15-38-25\LibreTV-HarmonyOS\dev\_local_signing\use-opensource.cmd
+<你的本地仓库目录>\LibreTV-HarmonyOS\dev\_local_signing\use-opensource.cmd
 ```
 
 看到窗口打印 `[完成] build-profile.json5 已改为 signingConfigs: []` 就可以了，按任意键关闭。
@@ -141,6 +142,7 @@ C:\Users\75148\WorkBuddy\2026-10-16-15-38-25\LibreTV-HarmonyOS\dev\_local_signin
 - [ ] 列表里**没有** `.p12` / `.cer` / `.p7b` / `.ohos`
 - [ ] 列表里**没有** `.hap` / `build/`
 - [ ] 点开 `build-profile.json5`，右侧绿色新增里**没有** `password` 字样
+- [ ] 看一眼 `app_icon.png` 的缩略图，图标里**没有**品牌字母（想换回自己的图标：`python scripts/make-app-icon.py --write` 前改常量，或直接覆盖那张 PNG）
 
 只要有一项不对，**先别提交**，回到上面重新脱敏。
 
@@ -348,7 +350,8 @@ GitHub 单文件上限 100 MB。本项目已经把 `*.hap`、`build/`、`dev/` �
 
 - [ ] 双击过 `dev\_local_signing\use-opensource.cmd`（或手动确认 `"signingConfigs": []`）
 - [ ] Changes 列表里没有 `dev/`、`.ohos/`、`*.p12`、`*.cer`、`*.p7b`、`*.hap`
-- [ ] `build-profile.json5` 的 diff 里没有 `password`、没有 `C:\\Users\\75148`
+- [ ] `build-profile.json5` 的 diff 里没有 `password`、没有 `C:\\Users\\<你的用户名>`
+- [ ] `app_icon.png` 是通用图标，图里没有品牌字母
 - [ ] Summary 写清楚了这次改了什么（建议带 `feat:` / `fix:` 前缀）
 - [ ] 点完 `Commit to main` 后，**又点了 `Push origin`**
 - [ ] 打开 GitHub 网页刷新，能看到这次改动

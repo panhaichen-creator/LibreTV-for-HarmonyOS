@@ -13,6 +13,9 @@ import { DetailPageParam } from './DetailPage';
 import { latestNavParam } from '../common/NavParam';
 import { SystemInsets } from '../common/SystemInsets';
 import { BlurFade } from '../common/BlurFade';
+import { SuggestItem } from '../model/DoubanClient';
+import { SuggestEngine, SuggestSink } from '../model/SuggestEngine';
+
 
 export interface SearchPageParam {
   keyword: string;
@@ -30,6 +33,18 @@ export struct SearchResultPage {
   @State failedCount: number = 0;
   @State historyWords: string[] = [];
 
+  // ---------- 搜索栏联想 ----------
+  /** 候选项：最多 6 条，与首页同一套面板 */
+  @State suggestItems: SuggestItem[] = [];
+  /** 请求在飞：面板里先显示一行「正在联想」 */
+  @State suggestLoading: boolean = false;
+  /** 只在「有输入」时展开，清空立即收起 */
+  @State suggestOpen: boolean = false;
+  /** 防抖 / 作废 / 两段式补全都交给共用引擎 */
+  private suggestEngine: SuggestEngine = new SuggestEngine();
+  /** 程序化回填的输入值：等值 onChange 视为回声，不触发联想 */
+  private quietValue: string = '';
+
   /** 已经处理过的路由参数：缓存节点复用后靠它判断「这次是不是换了个关键词」 */
   private appliedKeyword: string = '';
 
@@ -37,7 +52,7 @@ export struct SearchResultPage {
     this.historyWords = HistoryStore.shared().getSearchHistory();
     if (this.keyword !== '') {
       this.appliedKeyword = this.keyword;
-      this.searchValue = this.keyword;
+      this.setSearchQuiet(this.keyword);
       this.runSearch();
     }
   }
@@ -47,6 +62,7 @@ export struct SearchResultPage {
   }
 
   private async runSearch(): Promise<void> {
+    this.closeSuggest();
     const wd = this.searchValue.trim();
     if (wd === '') {
       this.toast('请输入搜索关键词');
@@ -217,22 +233,37 @@ export struct SearchResultPage {
             .onClick(() => {
               this.navPathStack.pop();
             })
-            Search({
-              placeholder: '搜索电影 / 电视剧',
-              value: $$this.searchValue
-            })
-              .layoutWeight(1)
-              .height(36)
-              .searchButton('搜索', { fontSize: 14, fontColor: $r('app.color.color_primary') })
-              .onSubmit((value: string) => {
-                this.runSearch();
+            // 搜索框 + 联想面板放进同一个纵向流：
+            // 面板是输入框的兄弟节点、按它的盒底排下来，天然贴在正下方，
+            // 不会像叠层那样压住输入框（首页踩过这个坑，这里一开始就这么写）。
+            Column({ space: 6 }) {
+              Search({
+                placeholder: '搜索电影 / 电视剧',
+                value: $$this.searchValue
               })
+                .width('100%')
+                .height(36)
+                .searchButton('搜索', { fontSize: 14, fontColor: $r('app.color.color_primary') })
+                .onSubmit((value: string) => {
+                  this.runSearch();
+                })
+                .onChange((value: string) => {
+                  this.onSearchInput(value);
+                })
+              if (this.suggestOpen && (this.suggestItems.length > 0 || this.suggestLoading)) {
+                this.suggestPanel()
+              }
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
           }
           .width('100%')
+          // 对齐到顶：面板展开时整行会变高，回退按钮不能被拽到中间去
+          .alignItems(VerticalAlign.Top)
           .padding({ left: 12, right: 12, top: 8 + SystemInsets.top(), bottom: 8 })
-          .backgroundColor($r('app.color.color_nav_glass'))
-          .backgroundEffect({ radius: 18, saturation: 1.6 })
-          .border({ width: { bottom: 1 }, color: $r('app.color.color_nav_border') })
+          // 不给底色/磨砂/底边描边：顶部与结果区是同一块页面渐变，
+          // 滚动内容由上面的 BlurFade 虚化，两者之间不再有可见分界。
+          
       }
       .width('100%')
       .height('100%')
@@ -252,12 +283,124 @@ export struct SearchResultPage {
       }
       this.appliedKeyword = p.keyword;
       this.keyword = p.keyword;
-      this.searchValue = p.keyword;
+      this.setSearchQuiet(p.keyword);
       this.results = [];
       this.failedCount = 0;
       this.searched = false;
       this.runSearch();
     })
+  }
+
+  // ---------- 搜索联想 ----------
+
+  /** 程序化回填输入框：等那次等值 onChange 到来时忽略它 */
+  private setSearchQuiet(v: string): void {
+    this.quietValue = v;
+    this.searchValue = v;
+  }
+
+  private onSearchInput(value: string): void {
+    // 进页面时带入关键词、点候选、点历史词 —— 这些回填都会回抛一次等值 onChange。
+    // 那是回声不是输入，吞掉；只有用户真的改了关键字才展开联想。
+    if (value === this.quietValue) {
+      this.quietValue = '';
+      return;
+    }
+    this.quietValue = '';
+    this.suggestOpen = value.trim() !== '';
+    // 兜底池：本页能拿到的「片名」就是搜索历史
+    this.suggestEngine.setPool(HistoryStore.shared().getSearchHistory());
+    this.suggestEngine.input(value, this.suggestSink());
+  }
+
+  /** 引擎出口 -> 页面 @State */
+  private suggestSink(): SuggestSink {
+    return {
+      onUpdate: (items: SuggestItem[], loading: boolean): void => {
+        this.suggestItems = items;
+        this.suggestLoading = loading;
+      },
+      onClose: (): void => {
+        this.suggestItems = [];
+        this.suggestLoading = false;
+        this.suggestOpen = false;
+      }
+    };
+  }
+
+  private closeSuggest(): void {
+    this.suggestEngine.close(this.suggestSink());
+  }
+
+  /** 点中候选：回填并直接搜（用户要的是片子，不是豆瓣条目页） */
+  private pickSuggest(item: SuggestItem): void {
+    this.setSearchQuiet(item.title);
+    this.runSearch();
+  }
+
+  /**
+   * 联想面板：磨砂卡片 + 一行一条。
+   * 高度由行数撑，最多 6 行，不会把结果区盖死。
+   */
+  @Builder
+  suggestPanel() {
+    Column() {
+      Column() {
+        if (this.suggestItems.length === 0) {
+          Row({ space: 8 }) {
+            LoadingProgress()
+              .width(16)
+              .height(16)
+              .color($r('app.color.color_text_secondary'))
+            Text('正在联想片名…')
+              .fontSize(13)
+              .fontColor($r('app.color.color_text_secondary'))
+          }
+          .width('100%')
+          .height(44)
+          .padding({ left: 14, right: 14 })
+          .alignItems(VerticalAlign.Center)
+        } else {
+          ForEach(this.suggestItems, (item: SuggestItem) => {
+            Row({ space: 8 }) {
+              Text(item.title)
+                .fontSize(14)
+                .fontColor($r('app.color.color_text'))
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .layoutWeight(1)
+              if (item.year !== '') {
+                Text(item.year)
+                  .fontSize(11)
+                  .fontColor($r('app.color.color_text_secondary'))
+                  .maxLines(1)
+              }
+              Text(item.kind)
+                .fontSize(10)
+                .fontColor($r('app.color.color_text_secondary'))
+                .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+                .borderRadius(6)
+                .backgroundColor($r('app.color.color_caption_glass'))
+            }
+            .width('100%')
+            .height(42)
+            .padding({ left: 14, right: 14 })
+            .alignItems(VerticalAlign.Center)
+            .onClick(() => {
+              this.pickSuggest(item);
+            })
+          }, (item: SuggestItem) => item.title + '|' + item.year + '|' + item.kind)
+        }
+      }
+      .width('100%')
+      .padding({ top: 4, bottom: 4 })
+      .backgroundColor($r('app.color.color_panel_glass'))
+      .backgroundEffect({ radius: 18, saturation: 1.6 })
+      .borderRadius(16)
+      .border({ width: 1, color: $r('app.color.color_nav_border') })
+      .shadow({ radius: 18, color: $r('app.color.color_glass_shadow'), offsetY: 6 })
+    }
+    .width('100%')
   }
 
   @Builder
@@ -295,7 +438,7 @@ export struct SearchResultPage {
               .padding({ left: 12, right: 12, top: 6, bottom: 6 })
               .margin({ right: 8, bottom: 8 })
               .onClick(() => {
-                this.searchValue = w;
+                this.setSearchQuiet(w);
                 this.runSearch();
               })
           }, (w: string) => w)

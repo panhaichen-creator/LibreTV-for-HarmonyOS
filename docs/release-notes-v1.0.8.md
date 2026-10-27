@@ -37,7 +37,7 @@ abd8b065dd7ee438e0a63e5982017cc88136e405b7fb5fbde260ed632289bd1c
 
 ### 文档
 
-- 新增 [GitHub Desktop 上传指南](docs/GITHUB_DESKTOP_GUIDE.md)（零基础，含脱敏自查清单）
+- 新增 [GitHub Desktop 上传指南](GITHUB_DESKTOP_GUIDE.md)（零基础，含脱敏自查清单）
 
 ## 环境要求
 

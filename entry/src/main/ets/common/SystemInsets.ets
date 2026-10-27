@@ -10,6 +10,8 @@
  * 注意：这是普通静态字段而不是 @State —— 它在首帧之前就已经写好，
  * 页面读取时不需要响应式更新；写成状态反而会在启动阶段触发一次无谓重排。
  */
+import { display, window } from '@kit.ArkUI';
+
 export class SystemInsets {
   /** 状态栏高度（vp）。取不到时给一个保守值，宁可多留一点也不压字 */
   private static topVp: number = 38;
@@ -32,6 +34,31 @@ export class SystemInsets {
 
   static top(): number {
     return SystemInsets.topVp;
+  }
+
+  /**
+   * 量一次「状态栏占了多少 vp」。
+   *
+   * 返回 -1 表示取不到窗口或密度（调用方应保持原值，别拿坏值冲掉已知的正确值）；
+   * 返回 0 是**有效值**——横屏全屏时系统会把状态栏收起来，此时顶部栏贴边即可。
+   *
+   * 为什么不能只用 set() 的那套：set() 会把 20 以下的数当成「量坏了」丢掉，
+   * 于是横屏的 0 永远写不进去，页面只能靠 landscape 分支猜。
+   */
+  static measureTopVp(win: window.Window | null): number {
+    if (win === null) {
+      return -1;
+    }
+    try {
+      const density: number = display.getDefaultDisplaySync().densityPixels;
+      if (density <= 0) {
+        return -1;
+      }
+      const area: window.AvoidArea = win.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM);
+      return area.topRect.height / density;
+    } catch (e) {
+      return -1;
+    }
   }
 
   static bottom(): number {
