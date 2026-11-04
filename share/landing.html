@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>LibreTV 影视分享</title>
+
+<!--
+  这个页面是「分享落地页」，作用是把 libretv:// 的自定义 scheme 藏到 https 链接后面：
+    · 微信把它当普通网页，用下面这几个 Open Graph 标签生成聊天卡片（带封面）；
+    · 页面打开后自动跳 libretv://play?... 拉起 APP；
+    · 微信内置浏览器不允许直接跳第三方 scheme —— 检测到 MicroMessenger 时
+      改成「点右上角 → 在浏览器打开」的引导层，这是没有微信开放平台权限时
+      唯一可行的路径。
+
+  参数（全部由 APP 端 ShareLink.build 拼好）：
+    src=源 key  id=vodId  ep=集下标  t=片名  n=集名  p=封面地址
+
+  ⚠️ 静态托管的局限：og:title / og:image 是写死的，微信卡片只能显示这一张图。
+  想让卡片显示「每部片子各自的封面」，必须由服务端按 ?p= 动态渲染这几个 meta
+  （同一个 HTML 套模板即可），静态服务器做不到。
+-->
+<meta property="og:type" content="video.movie" />
+<meta property="og:site_name" content="LibreTV" />
+<meta property="og:title" content="LibreTV 影视分享" />
+<meta property="og:description" content="点击即可在 LibreTV 里全屏播放" />
+<meta property="og:image" content="https://dummyimage.com/600x800/1a1a1e/f2f2f5&text=LibreTV" />
+
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    font-family: -apple-system, "HarmonyOS Sans", "PingFang SC", sans-serif;
+    background: #101014; color: #f2f2f5; padding: 24px;
+  }
+  .card { width: 100%; max-width: 420px; text-align: center; }
+  .poster {
+    width: 180px; height: 240px; border-radius: 14px; object-fit: cover;
+    background: #26262e; box-shadow: 0 12px 40px rgba(0,0,0,.45);
+  }
+  h1 { font-size: 20px; margin: 18px 0 6px; }
+  p { font-size: 13px; color: #9c9ca6; margin: 0 0 22px; line-height: 1.6; }
+  a.btn {
+    display: block; padding: 14px; border-radius: 24px; text-decoration: none;
+    background: #f2555a; color: #fff; font-size: 15px; font-weight: 600;
+  }
+  .tip {
+    margin-top: 18px; padding: 16px; border-radius: 14px;
+    background: #1c1c22; border: 1px solid #3a3a46;
+    font-size: 14px; color: #e6e6ee; line-height: 1.9; text-align: left;
+  }
+  .tip b { color: #f2555a; }
+  .step { display: inline-block; width: 20px; color: #f2555a; font-weight: 700; }
+</style>
+</head>
+<body>
+<div class="card">
+  <img class="poster" id="poster" alt="影片封面"
+       src="https://dummyimage.com/360x480/26262e/9c9ca6&text=LibreTV" />
+  <h1 id="title">LibreTV 影视分享</h1>
+  <p id="sub">正在为你打开 LibreTV…</p>
+  <a class="btn" id="open" href="#">在 LibreTV 里播放</a>
+  <div class="tip" id="tip">
+    <span class="step">①</span> 点击右上角 <b>「···」</b> 按钮<br />
+    <span class="step">②</span> 选择 <b>「在浏览器打开」</b><br />
+    打开后 <b>自动播放</b>，无需再次操作。
+  </div>
+</div>
+
+<script>
+(function () {
+  var q = new URLSearchParams(location.search);
+  var t = q.get('t') || '';
+  var p = q.get('p') || '';
+  var deep = 'libretv://play?' + location.search.replace(/^\?/, '');
+
+  if (t) { document.getElementById('title').textContent = decodeURIComponent(t); document.title = decodeURIComponent(t); }
+  if (p) { document.getElementById('poster').src = decodeURIComponent(p); }
+
+  var a = document.getElementById('open');
+  a.href = deep;
+
+  var isWx = /MicroMessenger/i.test(navigator.userAgent);
+  // 提示块现在默认就显示（微信里是唯一可行的路径），这里只负责把副标题写清楚
+  var isHarmony = /HarmonyOS|OpenHarmony/i.test(navigator.userAgent);
+
+  if (isWx) {
+    document.getElementById('sub').textContent = '点击右上角「···」→「在浏览器打开」即可自动播放';
+  } else {
+    // 非微信环境：直接拉起 APP；1.2s 后仍在页面说明没装 APP
+    setTimeout(function () {
+      location.href = deep;
+    }, 120);
+    setTimeout(function () {
+      document.getElementById('sub').textContent =
+        '没有自动打开？请确认已安装 LibreTV';
+    }, 1600);
+  }
+})();
+</script>
+</body>
+</html>

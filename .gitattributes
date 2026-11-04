@@ -1,0 +1,32 @@
+# 统一换行符，避免 Windows 提交后整个仓库显示 "全文件已修改"
+* text=auto eol=lf
+
+# 源码与配置
+*.ets      text eol=lf
+*.ts       text eol=lf
+*.js       text eol=lf
+*.json     text eol=lf
+*.json5    text eol=lf
+*.md       text eol=lf
+*.ps1      text eol=lf
+*.sh       text eol=lf
+*.py       text eol=lf
+
+# 二进制：不要做任何换行转换
+*.png      binary
+*.jpg      binary
+*.jpeg     binary
+*.gif      binary
+*.webp     binary
+*.svg      text eol=lf
+*.hap      binary
+*.app      binary
+*.p12      binary
+*.cer      binary
+*.p7b      binary
+*.jar      binary
+*.gz       binary
+*.zip      binary
+
+# 让 GitHub linguist 正确识别主语言
+*.ets      linguist-language=TypeScript

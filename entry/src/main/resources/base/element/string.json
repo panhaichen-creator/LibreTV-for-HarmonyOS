@@ -1,0 +1,44 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "多源聚合影视播放器"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "LibreTV"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "多源聚合影视播放器"
+    },
+    {
+      "name": "permission_internet_reason",
+      "value": "需要访问网络以搜索视频源并播放在线流媒体"
+    },
+    {
+      "name": "permission_network_reason",
+      "value": "需要检测网络状态以便在离线时给出提示"
+    },
+    {
+      "name": "permission_camera_reason",
+      "value": "需要使用相机扫描二维码以导入订阅或播放列表"
+    },
+    {
+      "name": "permission_background_reason",
+      "value": "投屏到电视等设备后，需要在后台保持投屏会话以维持远端播放"
+    },
+    {
+      "name": "brand_name",
+      "value": "LibreTV"
+    },
+    {
+      "name": "brand_about_title",
+      "value": "LibreTV 鸿蒙原生客户端"
+    },
+    {
+      "name": "brand_disclaimer",
+      "value": "本应用仅提供网络视频播放能力，不内置、不提供、不推荐任何视频内容或片源；所有播放地址均由用户自行添加，内容来源与版权责任由用户自负。本应用与任何电视台、影视平台及内容服务商均无关联，亦未获其授权或认可。"
+    }
+  ]
+}

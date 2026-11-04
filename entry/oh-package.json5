@@ -1,0 +1,9 @@
+{
+  "name": "entry",
+  "version": "2.5.5",
+  "description": "LibreTV native client entry module",
+  "main": "",
+  "author": "LibreTV Community",
+  "license": "AGPL-3.0",
+  "dependencies": {}
+}

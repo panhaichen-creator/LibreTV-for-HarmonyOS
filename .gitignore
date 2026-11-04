@@ -1,0 +1,106 @@
+# ---------- 构建产物 ----------
+/build/
+/entry/build/
+/entry/.preview/
+/entry/.test/
+.hvigor/
+oh_modules/
+node_modules/
+*.hap
+*.app
+*.hsp
+*.har
+.cxx
+.appanalyzer
+*.tsbuildinfo
+
+# ---------- 签名材料（绝对不能提交）----------
+.ohos/
+*.p12
+*.cer
+*.p7b
+*.csr
+*.keystore
+*.jks
+signingConfigs.json
+
+# ---------- IDE / 编辑器 ----------
+.idea/
+.vscode/
+*.iml
+.codegenie/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- 本地配置 ----------
+local.properties
+.clangd
+.clang-format
+.clang-tidy
+
+# ---------- 版本号自动递增的本机状态 ----------
+# scripts/version.js 用它记住「上次打包时的源码指纹」，每台机器各自一份，
+# 提交上去会让别人第一次构建就平白多一个版本号
+scripts/.version-state.json
+
+# ---------- 本地品牌名 ----------
+# scripts/brand.js 用它决定「签名构建装出来的应用叫什么」。
+# 公开仓库里不该出现这个名字；文件缺失时脚本会自动回落成 LibreTV。
+scripts/.brand-local.json
+
+# ---------- 发布脚本的本机配置 ----------
+# scripts/package-release.js 从这里读「桌面在哪」。桌面被重定向到别的盘时
+# （桌面被重定向到别的盘时）USERPROFILE\Desktop 是不存在的，必须有这层配置。
+scripts/.release-desktop.json
+
+# ---------- 开发过程杂物（截图、日志、一次性补丁脚本）----------
+dev/
+*.log
+*.log.*
+
+# 一次性补丁脚本 / hdc 抓下来的布局 JSON / 构建日志
+patch_*.py
+_patch_*.py
+_*.py
+_*.json
+_*.txt
+
+# 真机诊断截图（_z1.jpeg、_crop_top.png 这类），以及 verify_ 前缀的验证图
+_*.png
+_*.jpeg
+_*.jpg
+_*.webp
+verify_*.png
+verify_*.jpeg
+verify_*.jpg
+
+# 构建前会把旧的 build / .hvigor 目录改名挪走（直接让 hvigor 删除会被沙箱拦，导致构建失败）。
+# 历史上有过两种命名：更早的 "_old_" 和现在的 "_bak_<时间戳>"，两种都要挡掉 ——
+# 一个 build_bak 目录就有几十 MB，混进提交会把仓库撑爆。
+/entry/build_old_*/
+/entry/build_bak_*/
+/build_bak_*/
+/.hvigor_old_*/
+/.hvigor_bak_*/
+/hvigor_old_*/
+/hvigor_bak_*/
+
+# ---------- 压缩包 / 离线产物 ----------
+*.zip
+*.7z
+*.rar
+
+# ---------- AI 助手的本地记忆 / 工具链 ----------
+# 含本机绝对路径、操作记录，属于开发过程产物，不进仓库
+.workbuddy-ai/
+
+# ---------- Android TV 端工程 ----------
+# README 的「Android TV 版」一节讲的就是这个目录，但它现在有 409MB：
+# 里面是 build 产物、apk、上百张调试截图，还有 libretv.jks 密钥库与
+# keystore.properties —— 未经脱敏不能进仓库。要开源请先裁出「只含源码 +
+# Gradle 配置」的子集，再单独提交。
+/android/
+
+# ---------- 根目录临时截图 ----------
+/qb6.jpeg

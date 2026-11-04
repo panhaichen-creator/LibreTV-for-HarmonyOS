@@ -1,0 +1,10 @@
+{
+  "app": {
+    "bundleName": "com.libretv.panpp",
+    "vendor": "libretv",
+    "versionCode": 1100159,
+    "versionName": "2.5.5",
+    "icon": "$media:app_icon",
+    "label": "$string:app_name"
+  }
+}
