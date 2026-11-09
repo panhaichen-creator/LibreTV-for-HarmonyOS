@@ -55,7 +55,8 @@ export struct SettingsPage {
     { key: '1.0', label: '1.0x（正常）' },
     { key: '1.25', label: '1.25x' },
     { key: '1.5', label: '1.5x' },
-    { key: '2.0', label: '2.0x' }
+    { key: '2.0', label: '2.0x' },
+    { key: '3.0', label: '3.0x' }
   ];
 
   private toast(msg: string): void {
