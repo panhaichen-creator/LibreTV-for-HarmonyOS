@@ -1,3 +1,6 @@
+import { SleepTimer } from '../common/SleepTimer';
+import { SleepTimerChoice, SleepTimerDialog } from '../common/SleepTimerDialog';
+import { CastBackgroundTask } from '../common/CastBackgroundTask';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { DlnaProbe } from '../common/DlnaProbe';
 import { CastControl, DlnaControl, NativeCastControl } from '../common/CastControl';
@@ -89,6 +92,8 @@ export struct PlayerPage {
   private castAssetId: string = '';
   private castSavedAt: number = 0;
   private castSyncPending: boolean = false;
+  @State castPhase: string = '';
+  @State castPhaseError: string = '';
   private castPollTimer: number = -1;
 
   private player: AvPlayerController = new AvPlayerController();
@@ -102,6 +107,7 @@ export struct PlayerPage {
   private settings: Settings = SettingsStore.shared().get();
   private starting: boolean = false;
   private released: boolean = false;
+  @StorageLink('sleepTimerLabel') sleepTimerLabel: string = '未开启';
   private resumeTimer: number = -1;
   /** 分集加载任务：startPlay 必须等它完成，否则 episodes 还是空数组 */
   private loadTask: Promise<void> | null = null;
@@ -176,7 +182,7 @@ export struct PlayerPage {
   @State castVolume: number = 50;
   private castPreviousLandscape: boolean = true;
   private castDevice: avSession.OutputDeviceInfo | null = null;
-  @State rotationMode: string = 'landscape';
+  @State rotationMode: string = SettingsStore.shared().get().playerRotation;
   @State pauseHintVisible: boolean = false;
   private pauseHintTimer: number = -1;
   private navigationIndicatorVisible: boolean = true;
@@ -270,7 +276,6 @@ export struct PlayerPage {
   /** 长按后抬手要吃掉这次 click，否则会顺带把控制条呼出来 */
   private suppressTap: boolean = false;
   /** 长按加速的倍速 */
-  private static readonly PRESS_SPEED: number = 3.0;
   /** 长按判定时长（毫秒）：太短会和"轻点唤出控制条"撞车 */
   private static readonly PRESS_DELAY_MS: number = 600;
   /** 横向滑满一屏对应的跳转时长（毫秒） */
@@ -289,6 +294,14 @@ export struct PlayerPage {
   /** 交给 VideoSurface 的 XComponent 控制器：创建画中画必须把它传给 PiPWindow */
   private xController: XComponentController = new XComponentController();
   private pipController: PiPWindow.PiPController | null = null;
+  private sleepTimerDialogController: CustomDialogController | undefined = undefined;
+  @State private sleepTimerDialogOpen: boolean = false;
+  private sleepTimerDialogRelayoutPending: boolean = false;
+  private sleepTimerDialogRelayoutTimer: number = -1;
+  private sleepTimerAnchorLeft: number = 0;
+  private sleepTimerAnchorRight: number = 0;
+  private sleepTimerAnchorTop: number = 0;
+  private sleepTimerAnchorBottom: number = 0;
   @State pipAvailable: boolean = false;
   @State pipStarting: boolean = false;
   private pipBrowsing: boolean = false;
@@ -413,6 +426,7 @@ export struct PlayerPage {
     this.localResumePending = this.restoreCast === true;
     // 播放页存活期间保持屏幕常亮：平板全屏播放时系统休眠计时一到会直接黑屏锁屏
     this.holdScreen();
+    this.bindSleepTimer();
     this.syncSystemVolume();
     const recovered = this.recoverCast();
     if (!recovered) { this.prepareCastRecovery(); this.localResumePending = this.restoreCast === true; this.initCastSession(); }
@@ -421,10 +435,11 @@ export struct PlayerPage {
       this.cacheDir = hostCtx.filesDir + '/play';
     }
     this.currentEp = this.episode;
-    this.speedValue = this.settings.defaultSpeed;
+    this.speedValue = this.settings.rememberSpeed ? this.settings.lastSpeed : this.settings.defaultSpeed;
     this.positionText = Utils.formatTime(this.positionMs);
     // 收藏态在构造参数注入后即可读取（详情页 / 历史页都已带 sourceKey+vodId）
     this.favorite = HistoryStore.shared().isFavorite(this.sourceKey, this.vodId);
+    this.bindSleepTimer();
     this.bindCallbacks();
     // 前后台变化回调：判断画中画有没有接管，没接管就得自己停住
     AppLifecycle.bgHandler = (background: boolean) => {
@@ -633,7 +648,9 @@ export struct PlayerPage {
     // release() 里把常亮、投播会话、前后台回调都交还了，重新进入必须再拿回来
     this.holdScreen();
     this.settings = SettingsStore.shared().get();
-    this.speedValue = this.settings.defaultSpeed;
+    this.rotationMode = this.settings.playerRotation;
+    this.speedValue = this.settings.rememberSpeed ? this.settings.lastSpeed : this.settings.defaultSpeed;
+    this.bindSleepTimer();
     this.syncSystemVolume();
     const recovered = this.recoverCast();
     if (!recovered) { this.prepareCastRecovery(); this.localResumePending = this.restoreCast === true; this.initCastSession(); }
@@ -698,6 +715,7 @@ export struct PlayerPage {
       if (this.castController !== null || this.localResumePending) { return; }
       // 持续记录当前位置：画中画进出或画面重建导致重新 create 时，
       // startPlay 会用它做续播点；不记的话会跳回进页面时的老位置。
+      SleepTimer.check();
       this.positionMs = positionMs;
       // 进度在推进 = 没有卡顿：取消预约的检查并收掉加载圈
       if (positionMs > this.lastPosMs) {
@@ -1363,6 +1381,7 @@ export struct PlayerPage {
       return;
     }
     this.released = true;
+    if (CastHandoff.peek() === null) { SleepTimer.cancel(); SleepTimer.action = null; }
     if (this.resumeTimer >= 0) { clearTimeout(this.resumeTimer); this.resumeTimer = -1; }
     this.unwatchPlayerInsets();
     this.player.release();
@@ -1587,6 +1606,7 @@ export struct PlayerPage {
 
   private selectSpeed(speed: number): void {
     this.speedValue = speed;
+    if (this.settings.rememberSpeed) { SettingsStore.shared().update({ lastSpeed: speed }); }
     if (this.castController !== null) { this.castCommand('setSpeed', speed); }
     else { this.player.setSpeed(speed); }
     this.closePlayerPanels();
@@ -1974,7 +1994,10 @@ export struct PlayerPage {
   }
 
   private finishCastDisconnect(): void {
+    CastBackgroundTask.stop().catch(() => {});
     this.castGeneration++;
+    this.castPhase = '';
+    this.castPhaseError = '';
     this.castSyncPending = false;
     if (this.castPollTimer >= 0) { clearTimeout(this.castPollTimer); this.castPollTimer = -1; }
     this.showCastEpisodes = false;
@@ -2010,9 +2033,8 @@ export struct PlayerPage {
     console.info('[cast] disconnect requested');
     this.player.pause();
     // Stop playback before giving the output route back to the phone.
-    try { await controller.sendControlCommand({ command: 'stop' }); }
-    catch (e) { console.warn('[cast] remote stop failed: ' + JSON.stringify(e)); }
     try {
+      await controller.sendControlCommand({ command: 'stop' });
       if (!controller.direct) { await session.stopCasting(); }
       controller.off('playbackStateChange');
       controller.off('error');
@@ -2021,7 +2043,13 @@ export struct PlayerPage {
       console.info('[cast] disconnect completed');
     } catch (e) {
       console.error('[cast] disconnect failed: ' + JSON.stringify(e));
-      this.toast('断开失败，请重试');
+      this.getUIContext().getPromptAction().showDialog({
+        title: '未能确认电视已停止',
+        message: '电视可能仍在播放。可以保留遥控后重试，或仅退出遥控，电视可能继续播放。',
+        buttons: [{ text: '保留遥控', color: '#808080' }, { text: '仅退出遥控', color: '#E34D59' }]
+      }).then((result) => {
+        if (result.index === 1 && !this.released && this.castController === controller) { this.back(); }
+      }).catch(() => {});
     }
     } finally { this.castDisconnecting = false; }
   }
@@ -2046,6 +2074,7 @@ export struct PlayerPage {
 
   private completePlayback(): void {
     this.saveProgress();
+    if (SleepTimer.completed()) { return; }
     if (this.settings.autoNext && this.currentEp + 1 < this.episodes.length) {
       this.selectEpisode(this.currentEp + 1);
     } else {
@@ -2096,6 +2125,15 @@ export struct PlayerPage {
       this.localResumePending = false;
       this.castSyncPending = recovered === null && resumedState === null;
       this.castController = controller;
+      if (SleepTimer.selectedMinutes() !== -999) {
+        const context = this.getUIContext().getHostContext() as common.UIAbilityContext | undefined;
+        if (context !== undefined) {
+          CastBackgroundTask.start(context).catch(() => {
+            SleepTimer.cancel();
+            this.toast('后台计时未能启动，请保持应用在前台');
+          });
+        }
+      }
       this.errorText = '';
       if (recovered === null) { this.castPreviousLandscape = this.landscape; }
       this.castDevice = device;
@@ -2241,6 +2279,8 @@ export struct PlayerPage {
     const targetMs = switching ? 0 : requestedPosition;
     const commandVersion = this.castUserCommandVersion;
     this.castSyncPending = true;
+    this.castPhaseError = '';
+    this.castPhase = switching ? '正在准备下一集…' : '正在准备视频…';
     try {
       await this.ensureEpisodesLoaded();
       const ep = switching ? (this.episodes[index] ?? null) : this.playableEpisode();
@@ -2258,6 +2298,7 @@ export struct PlayerPage {
       console.info('[cast] preparing remote video');
       await controller.prepare(item);
       if (this.castController !== controller || this.released) { return false; }
+      this.castPhase = '正在等待电视起播…';
       console.info('[cast] starting remote video');
       await controller.start(item);
       if (this.castController !== controller || this.released) { return false; }
@@ -2278,22 +2319,26 @@ export struct PlayerPage {
       this.castAssetId = description.assetId;
       const alive = (): boolean => this.castController === controller && !this.released && this.castAssetId === description.assetId;
       const state = await CastResume.synchronize(controller, url, description.assetId, this.castDeviceName, targetMs, alive,
-        () => this.castUserCommandVersion === commandVersion);
+        () => this.castUserCommandVersion === commandVersion,
+        () => { if (alive()) { this.castPhase = '正在恢复至 ' + Utils.formatTime(targetMs) + '…'; } });
       if (!alive()) { return false; }
       if (state !== null) {
         this.applyCastState(state);
         if (this.castUserCommandVersion === commandVersion && targetMs > 0 && Math.abs((state.position?.elapsedTime ?? 0) - targetMs) > 5000) {
+          this.castPhaseError = '进度未恢复，请手动调整';
           this.toast('电视未能恢复到原进度，可尝试拖动进度条');
         }
       }
+      if (state === null) { this.castPhaseError = '暂未确认电视播放状态'; }
       this.rememberCast(true);
       return true;
     } catch (e) {
       console.error('[cast] remote playback failed: ' + JSON.stringify(e));
+      if (this.castController === controller && !this.released) { this.castPhaseError = '投播失败，请重试或换源'; }
       this.toast('电视无法播放此视频，请换源；部分源不允许电视直接访问');
       return false;
     } finally {
-      if (this.castController === controller) { this.castSyncPending = false; }
+      if (this.castController === controller) { this.castSyncPending = false; this.castPhase = ''; }
     }
   }
 
@@ -2865,6 +2910,7 @@ export struct PlayerPage {
           .onClick(() => {
             if (this.castDeviceName !== '') { this.applyCastRotation(mode); }
             else { this.applyLocalRotation(mode); }
+            SettingsStore.shared().update({ playerRotation: mode });
           })
       }, (mode: string) => mode)
     }.onAppear(() => {
@@ -2874,6 +2920,149 @@ export struct PlayerPage {
       this.showCastEpisodes = false;
       this.showCastConnection = false;
     })
+  }
+
+  private bindSleepTimer(): void {
+    SleepTimer.action = async () => {
+      // A newer player page can rebind the timer while the TV session is parked.
+      // Always stop the parked remote session before consulting this page's state.
+      if (CastHandoff.peek() !== null) { await CastHandoff.stop(); return; }
+      if (this.released) { return; }
+      this.endPress(true);
+      if (this.castController !== null) {
+        const controller = this.castController;
+        try {
+          await controller.sendControlCommand({ command: 'stop' });
+          if (!controller.direct && this.castSession !== null) { await this.castSession.stopCasting(); }
+          if (this.castController === controller) { this.finishCastDisconnect(); }
+          CastResume.clear();
+        } catch (e) {
+          this.toast('定时停止失败，电视可能仍在播放，请重试');
+          throw new Error('电视停止失败');
+        } finally {
+          await CastBackgroundTask.stop();
+        }
+      } else {
+        this.player.pause();
+        this.saveProgress();
+        this.toast('已按定时设置暂停');
+      }
+    };
+  }
+
+  private captureSleepTimerAnchor(area: Area): void {
+    const x = area.globalPosition.x;
+    const y = area.globalPosition.y;
+    if (x === undefined || y === undefined) { return; }
+    const left = Number.parseFloat(x.toString());
+    const top = Number.parseFloat(y.toString());
+    const width = Number.parseFloat(area.width.toString());
+    const height = Number.parseFloat(area.height.toString());
+    if (Number.isFinite(left) && Number.isFinite(width)) {
+      this.sleepTimerAnchorLeft = left;
+      this.sleepTimerAnchorRight = left + width;
+    }
+    if (Number.isFinite(top) && Number.isFinite(height)) {
+      this.sleepTimerAnchorTop = top;
+      this.sleepTimerAnchorBottom = top + height;
+    }
+  }
+
+  private showSleepTimer(): void {
+    if (this.sleepTimerDialogOpen) { return; }
+    this.sleepTimerDialogOpen = true;
+    this.openSleepTimerDialog();
+  }
+
+  private openSleepTimerDialog(): void {
+    const choices: SleepTimerChoice[] = [
+      { label: '15 分钟后停止', minutes: 15 },
+      { label: '30 分钟后停止', minutes: 30 },
+      { label: '60 分钟后停止', minutes: 60 },
+      { label: '本集结束后停止', minutes: -1 },
+      { label: '关闭定时', minutes: 0 }
+    ];
+    this.sleepTimerDialogController = new CustomDialogController({
+      maskColor: '#66000000',
+      customStyle: true,
+      cancel: () => {
+        if (!this.sleepTimerDialogRelayoutPending) { this.sleepTimerDialogOpen = false; }
+      },
+      alignment: this.sleepTimerDialogAlignment(),
+      offset: this.sleepTimerDialogOffset(),
+      builder: SleepTimerDialog({
+        currentLabel: SleepTimer.label(),
+        selectedMinutes: SleepTimer.selectedMinutes(),
+        listMaxHeight: Math.max(60, Math.min(this.canvasW > this.canvasH ? 180 : 300, this.canvasH - SystemInsets.top() - SystemInsets.bottom() - 100)),
+        isLandscape: this.canvasW > this.canvasH,
+        choices: choices,
+        onClose: () => { this.sleepTimerDialogOpen = false; },
+        onSelect: (minutes: number) => {
+          this.sleepTimerDialogOpen = false;
+          if (this.released) { return; }
+          this.selectSleepTimer(minutes).catch(() => {});
+        }
+      })
+    });
+    this.sleepTimerDialogController.open();
+  }
+
+  private sleepTimerDialogAlignment(): DialogAlignment {
+    if (this.canvasW <= this.canvasH) { return DialogAlignment.Bottom; }
+    const rightSide = this.sleepTimerAnchorLeft + this.sleepTimerAnchorRight > this.canvasW;
+    const openUp = this.sleepTimerAnchorTop > this.canvasH / 2;
+    if (openUp) { return rightSide ? DialogAlignment.BottomEnd : DialogAlignment.BottomStart; }
+    return rightSide ? DialogAlignment.TopEnd : DialogAlignment.TopStart;
+  }
+
+  private sleepTimerDialogOffset(): Offset {
+    if (this.canvasW <= this.canvasH) { return { dx: 0, dy: -SystemInsets.bottom() - 8 }; }
+    const rightSide = this.sleepTimerAnchorLeft + this.sleepTimerAnchorRight > this.canvasW;
+    const openUp = this.sleepTimerAnchorTop > this.canvasH / 2;
+    const dx = rightSide ? this.sleepTimerAnchorRight - this.canvasW : this.sleepTimerAnchorLeft;
+    const dy = openUp ? this.sleepTimerAnchorTop - this.canvasH - 8 : this.sleepTimerAnchorBottom + 8;
+    return { dx: dx, dy: dy };
+  }
+
+  private relayoutSleepTimerDialog(): void {
+    if (!this.sleepTimerDialogOpen || this.sleepTimerDialogController === undefined) { return; }
+    this.sleepTimerDialogRelayoutPending = true;
+    this.sleepTimerDialogController.close();
+    if (this.sleepTimerDialogRelayoutTimer !== -1) { clearTimeout(this.sleepTimerDialogRelayoutTimer); }
+    this.sleepTimerDialogRelayoutTimer = setTimeout(() => {
+      this.sleepTimerDialogRelayoutTimer = -1;
+      this.sleepTimerDialogRelayoutPending = false;
+      if (this.sleepTimerDialogOpen && !this.released) { this.openSleepTimerDialog(); }
+    }, 250);
+  }
+
+  private async selectSleepTimer(minutes: number): Promise<void> {
+    const casting = this.castController !== null || CastHandoff.peek() !== null;
+    const context = this.getUIContext().getHostContext() as common.UIAbilityContext | undefined;
+    if (minutes > 0 || minutes === -1) {
+      if (casting) {
+        if (context === undefined) { this.toast('无法启动投屏后台计时'); return; }
+        try {
+          await CastBackgroundTask.start(context);
+        } catch (e) {
+          this.toast('后台计时启动失败，请保持应用在前台');
+          return;
+        }
+      } else {
+        await CastBackgroundTask.stop().catch(() => {});
+      }
+    } else {
+      await CastBackgroundTask.stop().catch(() => {});
+    }
+    SleepTimer.set(minutes);
+    this.scheduleHideControls();
+  }
+
+  private castStatusLabel(): string {
+    if (this.castDisconnecting) { return '正在停止电视播放…'; }
+    if (this.castPhase !== '') { return this.castPhase; }
+    if (this.castPhaseError !== '') { return this.castPhaseError; }
+    return '';
   }
 
   @Builder
@@ -2886,12 +3075,23 @@ export struct PlayerPage {
           Text('投屏遥控器').fontSize(16).fontWeight(FontWeight.Medium).fontColor($r('app.color.color_text'))
           Text(this.castDeviceName).fontSize(12).fontColor($r('app.color.color_text_secondary'))
             .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+          if (this.castStatusLabel() !== '') {
+            Text(this.castStatusLabel()).fontSize(11).fontColor($r('app.color.color_text_secondary'))
+              .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+          }
         }.layoutWeight(1).alignItems(HorizontalAlign.Start)
         Button({ type: ButtonType.Circle }) {
           Image($r('app.media.ic_player_cast')).width(22).height(22).fillColor($r('app.color.color_primary'))
         }.width(40).height(40).padding(0).backgroundColor($r('app.color.color_chip_bg'))
           .accessibilityText('已连接到' + this.castDeviceName + '，打开投屏连接面板')
           .onClick(() => { this.showCastEpisodes = false; this.showCastConnection = true; })
+        Button({ type: ButtonType.Circle }) {
+          Image($r('app.media.ic_player_timer')).width(22).height(22)
+            .fillColor(this.sleepTimerLabel === '未开启' ? $r('app.color.color_text') : $r('app.color.color_primary'))
+        }.width(40).height(40).padding(0)
+          .backgroundColor($r('app.color.color_chip_bg'))
+          .accessibilityText('定时停止播放').onClick(() => { this.showSleepTimer(); })
+          .onAreaChange((_old: Area, area: Area) => { this.captureSleepTimerAnchor(area); })
         Button({ type: ButtonType.Circle }) {
           Image(this.rotationIcon()).width(22).height(22).fillColor(this.rotationMode === 'auto' ? $r('app.color.color_primary') : $r('app.color.color_text'))
         }.width(40).height(40).padding(0).backgroundColor($r('app.color.color_chip_bg'))
@@ -3007,7 +3207,7 @@ export struct PlayerPage {
         }
         if (this.pressSpeed) {
           Column() {
-            Text('3X')
+            Text(this.settings.longPressSpeed.toString() + 'X')
               .fontSize(15).fontWeight(FontWeight.Medium).fontColor(Color.White)
               .padding({ left: 12, right: 12, top: 5, bottom: 5 })
               .backgroundColor('#20000000').backgroundEffect({ radius: 6 })
@@ -3034,6 +3234,16 @@ export struct PlayerPage {
                 .onClick(() => {
                   this.back();
                 })
+              if (this.offlineDir === '' && this.title !== '') {
+                Button('换源')
+                  .fontSize(14)
+                  .fontColor(Color.White)
+                  .backgroundColor('#40FFFFFF')
+                  .onClick(() => {
+                    this.controlsVisible = true;
+                    this.runSpeedTest();
+                  })
+              }
               Button('重试')
                 .fontSize(14)
                 .backgroundColor($r('app.color.color_primary'))
@@ -3150,6 +3360,15 @@ export struct PlayerPage {
                 .enabled(!this.pipStarting)
                 .onClick(() => { this.enterPiP(); })
               }
+              Stack({ alignContent: Alignment.Center }) {
+                Image($r('app.media.ic_player_timer')).width(24).height(24)
+                  .fillColor(this.sleepTimerLabel === '未开启' ? Color.White : $r('app.color.color_primary'))
+              }
+              .width(34).height(34).borderRadius(17)
+              .backgroundColor($r('app.color.color_player_scrim'))
+              .accessibilityText('定时停止播放')
+              .onAreaChange((_old: Area, area: Area) => { this.captureSleepTimerAnchor(area); })
+              .onClick(() => { this.showSleepTimer(); })
               Stack({ alignContent: Alignment.Center }) {
                 Image(this.rotationIcon())
                   .width(22)
@@ -3617,10 +3836,13 @@ export struct PlayerPage {
         const w: number = this.areaNumber(newValue.width);
         const h: number = this.areaNumber(newValue.height);
         if (w > 0 && h > 0 && (w !== this.canvasW || h !== this.canvasH)) {
+          const wasLandscape = this.canvasW > this.canvasH;
+          const willBeLandscape = w > h;
           this.endPress(true);
           this.canvasW = w;
           this.canvasH = h;
           this.landscape = w > h;
+          if (wasLandscape !== willBeLandscape) { this.relayoutSleepTimerDialog(); }
           this.syncTopPad();
           if (w <= h && this.screenLocked) {
             this.screenLocked = false;
@@ -3895,6 +4117,7 @@ export struct PlayerPage {
    */
   private handleAppBackground(background: boolean): void {
     this.clearBgTimer();
+    SleepTimer.check();
     if (this.released) {
       return;
     }
@@ -4054,7 +4277,7 @@ export struct PlayerPage {
           this.pressSpeed = true;
           this.adjustKind = '';
           this.clearAdjustTimer();
-          this.player.setSpeed(PlayerPage.PRESS_SPEED);
+          this.player.setSpeed(this.settings.longPressSpeed);
         }, PlayerPage.PRESS_DELAY_MS);
       }
       return;
@@ -4114,7 +4337,7 @@ export struct PlayerPage {
   }
 
   private pressSpeedLabel(): string {
-    return PlayerPage.PRESS_SPEED.toFixed(1) + 'x 加速中';
+    return this.settings.longPressSpeed.toFixed(1) + 'x 加速中';
   }
 
   private seekDeltaText(): string {

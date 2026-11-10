@@ -7,8 +7,8 @@ const methods=part('  private resumePlayback(', '  /**\n   * 交还窗口状态'
  part('  private dismissPlayerControls()', '  private onSurfaceDestroy(')+
  part('  private selectSpeed(', '  private async runSpeedTest(');
 let id=0;const timers=new Map();
-const P=vm.runInNewContext(ts.transpile('class P{'+methods+'}',{target:ts.ScriptTarget.ES2020})+'\nP',{console,AppLifecycle:{},setTimeout:fn=>{timers.set(++id,fn);return id},clearTimeout:key=>timers.delete(key)});
-function player(){const p=new P();p.released=false;p.pipBrowsing=false;p.castController=null;p.controlsVisible=true;p.playing=true;
+const P=vm.runInNewContext(ts.transpile('class P{'+methods+'}',{target:ts.ScriptTarget.ES2020})+'\nP',{console,AppLifecycle:{},CastHandoff:{peek:()=>null},SleepTimer:{cancel:()=>{}},setTimeout:fn=>{timers.set(++id,fn);return id},clearTimeout:key=>timers.delete(key)});
+function player(){const p=new P();p.settings={rememberSpeed:false};p.released=false;p.pipBrowsing=false;p.castController=null;p.controlsVisible=true;p.playing=true;
  p.hideTimer=-1;p.resumeTimer=-1;p.holderFile=null;p.showSpeeds=false;p.showEpisodes=false;p.showSources=false;
  p.player={release:()=>{},setSpeed:()=>{}};p.xController={getXComponentSurfaceId:()=>''};
  for(const key of ['clearPauseHint','unwatchPlayerInsets','dropScreen','clearPressTimer','clearResync','clearBgTimer','releasePiP'])p[key]=()=>{};

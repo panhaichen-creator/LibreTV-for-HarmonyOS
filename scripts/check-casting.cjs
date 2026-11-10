@@ -1,8 +1,8 @@
-// Run with node scripts/check-casting.cjs [path-to-typescript]. No phone/TV required.
+// Run with node scripts/check-casting.cjs. No phone/TV required.
 const fs = require('node:fs');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
-const ts = require(process.argv[2] || '/Applications/DevEco-Studio.app/Contents/tools/arktsdoc/node_modules/typescript');
+const ts = require('./test-typescript.cjs');
 const source = fs.readFileSync('entry/src/main/ets/pages/PlayerPage.ets', 'utf8');
 const methods = source.slice(source.indexOf('  private async startRemotePlayback('), source.indexOf('  /** 把播放状态同步给投播会话'));
 const deviceListener = source.slice(source.indexOf('  private bindCastSession('), source.indexOf('  private releaseCastSession('));
@@ -10,7 +10,7 @@ const controls = source.slice(source.indexOf('  private dismissPlayerControls()'
 const callbacks = source.slice(source.indexOf('  private bindCallbacks()'), source.indexOf('  /**\n   * 离线播放自愈'));
 const compiled = ts.transpile('class TestPlayer {\n' + deviceListener + controls + callbacks + methods + '\n}', {target: ts.ScriptTarget.ES2020});
 let resolveUrl;
-const Player = vm.runInNewContext(compiled + '\nTestPlayer', {console, CastResume:{clear:()=>{},synchronize:async()=>null}, avSession:{AVCastCategory:{CATEGORY_REMOTE:1},ConnectionState:{STATE_CONNECTED:1,STATE_DISCONNECTED:0}}, PlayUrlResolver: {resolveSharePage: () => resolveUrl()}});
+const Player = vm.runInNewContext(compiled + '\nTestPlayer', {console, CastBackgroundTask:{stop:async()=>{}}, CastResume:{clear:()=>{},synchronize:async()=>null}, avSession:{AVCastCategory:{CATEGORY_REMOTE:1},ConnectionState:{STATE_CONNECTED:1,STATE_DISCONNECTED:0}}, PlayUrlResolver: {resolveSharePage: () => resolveUrl()}});
 async function run() {
   const p = new Player();
   p.rememberCast = () => {};

@@ -22,7 +22,7 @@ async function run(){
  const hung=C.read({...controller,getCurrentItem:()=>new Promise(()=>{})},last,'tv1');timeout();await assert.rejects(()=>hung);
  const s=fs.readFileSync('entry/src/main/ets/pages/PlayerPage.ets','utf8');
  const method=s.slice(s.indexOf('  private async connectRemote('),s.indexOf('  private rememberCast('));
- const P=vm.runInNewContext(ts.transpile('class P {\n'+method+'\n}',{target:ts.ScriptTarget.ES2020})+'\nP',{console,NativeCastControl:class {constructor(value){return value}},DlnaProbe:{read:async()=>{throw Error('not direct in this fixture')}},CastResume:reboot,avSession,Utils:{formatTime:()=>''}});
+ const P=vm.runInNewContext(ts.transpile('class P {\n'+method+'\n}',{target:ts.ScriptTarget.ES2020})+'\nP',{console,SleepTimer:{selectedMinutes:()=>-999},NativeCastControl:class {constructor(value){return value}},DlnaProbe:{read:async()=>{throw Error('not direct in this fixture')}},CastResume:reboot,avSession,Utils:{formatTime:()=>''}});
  let stops=0,starts=0,remoteChanged;
  function player(){const p=new P();p.endPress=()=>{};p.releasePiP=()=>{};p.clearPauseHint=()=>{};p.castGeneration=0;p.released=false;p.offlineDir='';p.restoreCast=true;p.castController=null;p.localResumePending=true;
  p.player={pause:()=>{}};

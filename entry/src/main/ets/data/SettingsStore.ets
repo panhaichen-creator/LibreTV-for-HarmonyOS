@@ -46,6 +46,12 @@ export class SettingsStore {
     if (patch.defaultSpeed !== undefined) {
       s.defaultSpeed = patch.defaultSpeed;
     }
+    if (patch.rememberSpeed !== undefined) { s.rememberSpeed = patch.rememberSpeed; }
+    if (patch.lastSpeed !== undefined && SettingsStore.validSpeed(patch.lastSpeed)) { s.lastSpeed = patch.lastSpeed; }
+    if (patch.longPressSpeed !== undefined && [2, 3].includes(patch.longPressSpeed)) { s.longPressSpeed = patch.longPressSpeed; }
+    if (patch.playerRotation !== undefined && ['system', 'auto', 'landscape', 'portrait'].includes(patch.playerRotation)) {
+      s.playerRotation = patch.playerRotation;
+    }
     if (patch.playHistoryEnabled !== undefined) {
       s.playHistoryEnabled = patch.playHistoryEnabled;
     }
@@ -84,6 +90,13 @@ export class SettingsStore {
       if (speed > 0) {
         this.settings.defaultSpeed = speed;
       }
+      this.settings.rememberSpeed = SettingsStore.bool(rec['rememberSpeed'], false);
+      const lastSpeed = SettingsStore.num(rec['lastSpeed'], 1);
+      this.settings.lastSpeed = SettingsStore.validSpeed(lastSpeed) ? lastSpeed : 1;
+      const pressSpeed = SettingsStore.num(rec['longPressSpeed'], 3);
+      this.settings.longPressSpeed = [2, 3].includes(pressSpeed) ? pressSpeed : 3;
+      const rotation = SettingsStore.str(rec['playerRotation']);
+      this.settings.playerRotation = ['system', 'auto', 'landscape', 'portrait'].includes(rotation) ? rotation : 'landscape';
       this.settings.playHistoryEnabled = SettingsStore.bool(rec['playHistoryEnabled'], this.settings.playHistoryEnabled);
       this.settings.autoDiscover = SettingsStore.bool(rec['autoDiscover'], this.settings.autoDiscover);
     } catch (e) {
@@ -94,6 +107,10 @@ export class SettingsStore {
   private save(): void {
     Store.shared().putJson(SettingsStore.KEY, JSON.stringify(this.settings));
     EventBus.emit(Events.SETTINGS_CHANGED);
+  }
+
+  private static validSpeed(speed: number): boolean {
+    return [0.5, 0.75, 1, 1.25, 1.5, 2, 3].includes(speed);
   }
 
   private static str(v: object): string {

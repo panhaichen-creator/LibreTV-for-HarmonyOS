@@ -79,7 +79,7 @@ export class CastResume {
     } finally { if (timer >= 0) { clearTimeout(timer); } }
   }
   static async synchronize(controller: CastControl, mediaUri: string, assetId: string, deviceName: string,
-    targetMs: number | null, alive: () => boolean, keepResuming: () => boolean = () => true): Promise<avSession.AVPlaybackState | null> {
+    targetMs: number | null, alive: () => boolean, keepResuming: () => boolean = () => true, onSeek: () => void = () => {}): Promise<avSession.AVPlaybackState | null> {
     let latest: avSession.AVPlaybackState | null = null;
     let seeks = 0;
     let lastPosition = -1;
@@ -97,6 +97,7 @@ export class CastResume {
           const ready = lastPosition >= 0 && position > lastPosition ||
             latest.state === avSession.PlaybackState.PLAYBACK_STATE_PAUSE && attempt >= 4;
           if (ready && attempt - lastSeekAttempt >= 6) {
+            onSeek();
             console.info('[cast] correcting start position target=' + targetMs + ' actual=' + position);
             await controller.sendControlCommand({ command: 'seek', parameter: targetMs });
             seeks++;

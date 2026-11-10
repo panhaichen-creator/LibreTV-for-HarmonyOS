@@ -21,7 +21,7 @@ async function run() {
   const p = new Player();
   p.rememberCast = () => {};
   p.prepareCastRecovery = () => {};
-  for (const key of ['clearStall','clearWatchdog','clearResync','clearLoadingTimer','clearBgTimer','clearAdjustTimer','holdScreen','syncSystemVolume','initCastSession','resolvePic','dropScreen','toast']) p[key]=()=>{};
+  for (const key of ['bindSleepTimer','clearStall','clearWatchdog','clearResync','clearLoadingTimer','clearBgTimer','clearAdjustTimer','holdScreen','syncSystemVolume','initCastSession','resolvePic','dropScreen','toast']) p[key]=()=>{};
   p.recoverCast=()=>false; p.offlineDir='offline'; p.localResumePending=true;
   p.resetForReentry(); assert.equal(p.localResumePending,false);
   p.localResumePending=true;p.castController=null;p.positionMs=1800000;p.durationMs=3600000;

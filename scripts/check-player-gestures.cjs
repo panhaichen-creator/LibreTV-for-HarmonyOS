@@ -11,7 +11,7 @@ const P=vm.runInNewContext(ts.transpile('class PlayerPage { static PRESS_DELAY_M
   setTimeout:fn=>{timers.set(++id,fn);return id},clearTimeout:id=>timers.delete(id)
 });
 function create() {
-  const p=new P();p.castController=null;p.screenLocked=false;p.errorText='';p.canvasW=1000;p.durationMs=600000;p.playing=true;p.pressTimer=-1;
+  const p=new P();p.settings={longPressSpeed:3};p.castController=null;p.screenLocked=false;p.errorText='';p.canvasW=1000;p.durationMs=600000;p.playing=true;p.pressTimer=-1;
   p.seekPreviewTimer=-1;p.hideTimer=-1;p.controlsVisible=true;p.adjustKind='';p.speedValue=1;
   p.seeks=[];p.speeds=[];p.player={currentTime:()=>120000,seekTo:t=>p.seeks.push(t),setSpeed:s=>p.speeds.push(s)};
   p.dismissPlayerControls=()=>{p.controlsVisible=false;p.showSpeeds=false;p.showEpisodes=false;p.showSources=false};p.clearPauseHint=()=>{};p.applySeekUi=()=>{};p.hides=0;p.scheduleHideControls=()=>p.hides++;p.clearAdjustTimer=()=>{};

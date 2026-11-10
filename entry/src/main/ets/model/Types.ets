@@ -223,6 +223,10 @@ export interface Settings {
   /** douban_movie / douban_tv / douban_rank / bangumi */
   recommendSource: string;
   defaultSpeed: number;
+  rememberSpeed: boolean;
+  lastSpeed: number;
+  longPressSpeed: number;
+  playerRotation: string;
   playHistoryEnabled: boolean;
   /** 自动发现源：启动时拉取内置聚合订阅并验活入库（默认关闭） */
   autoDiscover: boolean;
@@ -235,6 +239,10 @@ export const DEFAULT_SETTINGS: Settings = {
   themeMode: 'system',
   recommendSource: 'douban_movie',
   defaultSpeed: 1.0,
+  rememberSpeed: false,
+  lastSpeed: 1.0,
+  longPressSpeed: 3.0,
+  playerRotation: 'landscape',
   playHistoryEnabled: true,
   autoDiscover: false
 };

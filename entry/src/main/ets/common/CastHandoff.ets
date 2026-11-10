@@ -1,3 +1,5 @@
+import { SleepTimer } from './SleepTimer';
+import { CastBackgroundTask } from './CastBackgroundTask';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { CastControl } from './CastControl';
 import { CastResume } from './CastResume';
@@ -30,6 +32,7 @@ export class CastHandoff {
 
   static park(value: ParkedCast): void {
     CastHandoff.value = value;
+    SleepTimer.action = async () => { await CastHandoff.stop(); };
     AppStorage.setOrCreate('activeCastLabel', value.deviceName);
     value.controller.off('playbackStateChange');
     value.controller.off('error');
@@ -42,7 +45,7 @@ export class CastHandoff {
       if (state.state !== undefined) {
         value.playing = state.state === avSession.PlaybackState.PLAYBACK_STATE_PLAY;
         if (state.state === avSession.PlaybackState.PLAYBACK_STATE_COMPLETED) {
-          CastHandoff.next(value);
+          if (!SleepTimer.completed()) { CastHandoff.next(value); }
         }
       }
       if (Date.now() - CastHandoff.savedAt > 5000) { CastHandoff.save(value); }
@@ -53,17 +56,13 @@ export class CastHandoff {
         return;
       }
       if (CastHandoff.value !== value) { return; }
-      CastHandoff.save(value);
-      CastHandoff.take();
-      value.session.destroy().catch(() => {});
+      CastHandoff.leaveRemotePlaying().catch(() => {});
     });
     value.session.on('outputDeviceChange', (state: avSession.ConnectionState, device: avSession.OutputDeviceInfo) => {
       if (value.controller.direct) { return; }
       const remote = device.devices.some((d: avSession.DeviceInfo) => d.castCategory === avSession.AVCastCategory.CATEGORY_REMOTE);
       if (CastHandoff.value === value && (state === avSession.ConnectionState.STATE_DISCONNECTED || !remote)) {
-        CastHandoff.save(value);
-        CastHandoff.take();
-        value.session.destroy().catch(() => {});
+        CastHandoff.leaveRemotePlaying().catch(() => {});
       }
     });
     CastHandoff.save(value);
@@ -86,15 +85,32 @@ export class CastHandoff {
   static async stop(): Promise<void> {
     const value = CastHandoff.value;
     if (value === null) { return; }
-    try { await value.controller.sendControlCommand({ command: 'stop' }); }
-    catch (e) { console.warn('[cast] parked remote stop failed: ' + JSON.stringify(e)); }
-    if (!value.controller.direct) { await value.session.stopCasting(); }
-    if (CastHandoff.value === value) {
-      CastHandoff.save(value);
-      CastHandoff.take();
-      CastResume.clear();
-      await value.session.destroy();
-    } else if (CastHandoff.value === null) { CastResume.clear(); }
+    try {
+      await value.controller.sendControlCommand({ command: 'stop' });
+      if (!value.controller.direct) { await value.session.stopCasting(); }
+      SleepTimer.cancel();
+      SleepTimer.action = null;
+      if (CastHandoff.value === value) {
+        CastHandoff.save(value);
+        CastHandoff.take();
+        CastResume.clear();
+        await value.session.destroy();
+      } else if (CastHandoff.value === null) { CastResume.clear(); }
+    } finally {
+      // A failed manual stop still owns its timer and must keep counting in the background.
+      if (SleepTimer.selectedMinutes() === -999) { await CastBackgroundTask.stop(); }
+    }
+  }
+
+  static async leaveRemotePlaying(): Promise<void> {
+    const value = CastHandoff.value;
+    if (value === null) { return; }
+    CastHandoff.save(value);
+    CastHandoff.take();
+    SleepTimer.cancel();
+    SleepTimer.action = null;
+    try { await value.session.destroy(); }
+    finally { await CastBackgroundTask.stop(); }
   }
 
   private static save(value: ParkedCast): void {

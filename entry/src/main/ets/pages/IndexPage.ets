@@ -1596,7 +1596,17 @@ struct IndexPage {
                 .onClick(() => {
                   if (this.activeCastLabel === '') { CastResume.clear(); return; }
                   CastHandoff.stop().catch(() => {
-                    this.getUIContext().getPromptAction().showToast({ message: '断开失败，请重试' });
+                    this.getUIContext().getPromptAction().showDialog({
+                      title: '未能确认电视已停止',
+                      message: '电视可能仍在播放。保留入口可以重试；仅退出遥控会保留恢复记录。',
+                      buttons: [{ text: '保留遥控', color: '#808080' }, { text: '仅退出遥控', color: '#E34D59' }]
+                    }).then((result) => {
+                      if (result.index === 1) {
+                        CastHandoff.leaveRemotePlaying().catch(() => {
+                          this.getUIContext().getPromptAction().showToast({ message: '退出遥控失败，请重试' });
+                        });
+                      }
+                    }).catch(() => {});
                   });
                 })
             }.width('100%').padding(12).borderRadius(18)

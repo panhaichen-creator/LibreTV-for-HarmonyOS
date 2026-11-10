@@ -25,6 +25,10 @@
       "value": "需要使用相机扫描二维码以导入订阅或播放列表"
     },
     {
+      "name": "permission_background_reason",
+      "value": "投屏定时停止需要在应用切到后台后继续计时"
+    },
+    {
       "name": "brand_name",
       "value": "LibreTV"
     },
