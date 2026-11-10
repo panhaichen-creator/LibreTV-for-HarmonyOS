@@ -1,0 +1,13 @@
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
+const ts=require('./test-typescript.cjs');
+const s=fs.readFileSync('entry/src/main/ets/pages/PlayerPage.ets','utf8');
+const a=s.indexOf('  private castStatusLabel()');const b=s.indexOf('  @Builder',a);
+const P=vm.runInNewContext(ts.transpile('class P{'+s.slice(a,b)+'}',{target:ts.ScriptTarget.ES2020})+'\nP');
+const p=new P();p.castPhase='';p.castPhaseError='';p.playing=true;
+assert.equal(p.castStatusLabel(),'');p.playing=false;assert.equal(p.castStatusLabel(),'');
+p.castPhaseError='进度未恢复，请手动调整';assert.equal(p.castStatusLabel(),p.castPhaseError);
+p.castPhase='正在等待电视起播…';assert.equal(p.castStatusLabel(),p.castPhase);
+p.castDisconnecting=true;assert.equal(p.castStatusLabel(),'正在停止电视播放…');
+assert.match(s,/Text\(this.castStatusLabel\(\)\)/);
+assert.match(s,/if \(this.castStatusLabel\(\) !== ''\)/);
+console.log('PASS: remote header shows disconnect, pending phase and failure; normal playback has no duplicate status row.');

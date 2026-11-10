@@ -38,6 +38,8 @@ import { SourcesPage } from './SourcesPage';
 import { DownloadsPage } from './DownloadsPage';
 import { SettingsPage } from './SettingsPage';
 import { AboutPage } from './AboutPage';
+import { CastResume } from '../common/CastResume';
+import { CastHandoff } from '../common/CastHandoff';
 import { SystemInsets } from '../common/SystemInsets';
 import { BlurFade } from '../common/BlurFade';
 import { DeepLink, ShareLink, ShareTarget } from '../common/ShareLink';
@@ -202,6 +204,8 @@ const LIVE_CARD_PALETTE: number = 7;
 @Entry
 @Component
 struct IndexPage {
+  @StorageLink('activeCastLabel') activeCastLabel: string = '';
+  @StorageLink('lastCastLabel') lastCastLabel: string = '';
   private navStack: NavPathStack = new NavPathStack();
   /** 推荐翻页起点：豆瓣按 page_start 分页，固定传 0 就会永远返回同一批「换一换」内容 */
   private recPageStart: number = 0;
@@ -332,6 +336,7 @@ struct IndexPage {
   @State downloadCount: number = 0;
 
   aboutToAppear(): void {
+    this.lastCastLabel = CastResume.load()?.deviceName ?? '';
     // 先用屏幕宽度给个初值，避免首帧按手机 3 列画完再跳成 8 列的闪烁；
     // 真正的值由 homeContent 上的 onAreaChange 实测覆盖。
     try {
@@ -1560,6 +1565,56 @@ struct IndexPage {
         // 节点被挂到 Navigation 内容上、位置完全不受控 ——
         // 表现就是胶囊大半截跑到屏幕底边之外（v23），或者干脆不出现（v22/v25）。
         this.bottomNavBar()
+        if (this.activeCastLabel !== '' || this.lastCastLabel !== '') {
+          Column() {
+            Row({ space: 10 }) {
+              Column({ space: 3 }) {
+                Text(this.activeCastLabel !== '' ? '正在投屏 · ' + this.activeCastLabel : '上次投屏到 · ' + this.lastCastLabel).fontSize(13)
+                  .fontColor($r('app.color.color_primary')).maxLines(1)
+                Text(this.activeCastLabel !== '' ? '点此返回遥控器' : '点此尝试恢复遥控').fontSize(11).fontColor($r('app.color.color_text_secondary'))
+              }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+                .onClick(() => {
+                  const cast = CastHandoff.peek();
+                  if (cast !== null) {
+                    const param: PlayerPageParam = { sourceKey: cast.record.sourceKey, vodId: cast.record.vodId,
+                      episode: cast.record.episode, episodeName: cast.record.episodeName ?? '',
+                      title: cast.record.name, positionMs: cast.record.positionMs, offlineDir: '' };
+                    this.navStack.pushPath({ name: 'Player', param: param });
+                  } else {
+                    const snapshot = CastResume.load();
+                    if (snapshot !== null) {
+                      const r = snapshot.record;
+                      const param: PlayerPageParam = { restoreCast: true, sourceKey: r.sourceKey, vodId: r.vodId,
+                        episode: r.episode, episodeName: r.episodeName ?? '', title: r.name, positionMs: r.positionMs,
+                        offlineDir: '', episodeUrl: r.playUrl, pic: r.pic, lineIndex: r.lineIndex };
+                      this.navStack.pushPath({ name: 'Player', param: param });
+                    }
+                  }
+                })
+              Button(this.activeCastLabel !== '' ? '断开' : '忽略').fontSize(12).backgroundColor($r('app.color.color_chip_bg'))
+                .fontColor($r('app.color.color_text'))
+                .onClick(() => {
+                  if (this.activeCastLabel === '') { CastResume.clear(); return; }
+                  CastHandoff.stop().catch(() => {
+                    this.getUIContext().getPromptAction().showDialog({
+                      title: '未能确认电视已停止',
+                      message: '电视可能仍在播放。保留入口可以重试；仅退出遥控会保留恢复记录。',
+                      buttons: [{ text: '保留遥控', color: '#808080' }, { text: '仅退出遥控', color: '#E34D59' }]
+                    }).then((result) => {
+                      if (result.index === 1) {
+                        CastHandoff.leaveRemotePlaying().catch(() => {
+                          this.getUIContext().getPromptAction().showToast({ message: '退出遥控失败，请重试' });
+                        });
+                      }
+                    }).catch(() => {});
+                  });
+                })
+            }.width('100%').padding(12).borderRadius(18)
+              .backgroundColor($r('app.color.color_card'))
+          }.width('100%').height('100%').justifyContent(FlexAlign.End)
+            .padding({ left: 16, right: 16, bottom: SystemInsets.bottom() + 84 })
+            .hitTestBehavior(HitTestMode.Transparent)
+        }
       }
       .width('100%')
       .height('100%')
@@ -1614,6 +1669,7 @@ struct IndexPage {
     } else if (name === 'Player') {
       PlayerPage({
         navPathStack: this.navStack,
+        restoreCast: (param as PlayerPageParam).restoreCast === true,
         sourceKey: (param as PlayerPageParam).sourceKey,
         vodId: (param as PlayerPageParam).vodId,
         episode: (param as PlayerPageParam).episode,

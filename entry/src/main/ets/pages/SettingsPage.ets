@@ -26,6 +26,9 @@ export struct SettingsPage {
   @State themeMode: string = SettingsStore.shared().get().themeMode;
   @State recommendSource: string = SettingsStore.shared().get().recommendSource;
   @State defaultSpeed: number = SettingsStore.shared().get().defaultSpeed;
+  @State rememberSpeed: boolean = SettingsStore.shared().get().rememberSpeed;
+  @State longPressSpeed: number = SettingsStore.shared().get().longPressSpeed;
+  @State playerRotation: string = SettingsStore.shared().get().playerRotation;
   @State playHistoryEnabled: boolean = SettingsStore.shared().get().playHistoryEnabled;
   @State autoDiscover: boolean = SettingsStore.shared().get().autoDiscover;
   @State activePanel: string = '';
@@ -55,7 +58,16 @@ export struct SettingsPage {
     { key: '1.0', label: '1.0x（正常）' },
     { key: '1.25', label: '1.25x' },
     { key: '1.5', label: '1.5x' },
-    { key: '2.0', label: '2.0x' }
+    { key: '2.0', label: '2.0x' },
+    { key: '3.0', label: '3.0x' }
+  ];
+
+  private static readonly PRESS_SPEEDS: OptionItem[] = [
+    { key: '2', label: '2X' }, { key: '3', label: '3X' }
+  ];
+  private static readonly ROTATIONS: OptionItem[] = [
+    { key: 'system', label: '跟随系统' }, { key: 'auto', label: '自动旋转' },
+    { key: 'landscape', label: '固定横屏' }, { key: 'portrait', label: '固定竖屏' }
   ];
 
   private toast(msg: string): void {
@@ -77,7 +89,7 @@ export struct SettingsPage {
 
   private speedLabel(value: number): string {
     const key = value.toString();
-    return this.labelOf(SettingsPage.SPEEDS, key);
+    return this.labelOf(SettingsPage.SPEEDS, key) || value.toString() + 'x';
   }
 
   private togglePanel(name: string): void {
@@ -139,6 +151,28 @@ export struct SettingsPage {
               })
               if (this.activePanel === 'speed') {
                 this.optionPanel('speed', SettingsPage.SPEEDS, this.defaultSpeed.toString())
+              }
+
+              SettingsRow({
+                rowTitle: '记住上次倍速', rowValue: this.rememberSpeed ? '开' : '关', rowShowArrow: false,
+                onRowClick: () => {
+                  this.rememberSpeed = !this.rememberSpeed;
+                  this.save({ rememberSpeed: this.rememberSpeed });
+                }
+              })
+              SettingsRow({
+                rowTitle: '长按加速', rowValue: this.longPressSpeed.toString() + 'X',
+                onRowClick: () => { this.togglePanel('pressSpeed'); }
+              })
+              if (this.activePanel === 'pressSpeed') {
+                this.optionPanel('pressSpeed', SettingsPage.PRESS_SPEEDS, this.longPressSpeed.toString())
+              }
+              SettingsRow({
+                rowTitle: '播放方向（自动记忆）', rowValue: this.labelOf(SettingsPage.ROTATIONS, this.playerRotation),
+                onRowClick: () => { this.togglePanel('rotation'); }
+              })
+              if (this.activePanel === 'rotation') {
+                this.optionPanel('rotation', SettingsPage.ROTATIONS, this.playerRotation)
               }
 
               SettingsRow({
@@ -294,6 +328,12 @@ export struct SettingsPage {
       .width('100%')
       .height('100%')
     }
+    .onShown(() => {
+      const settings = SettingsStore.shared().get();
+      this.rememberSpeed = settings.rememberSpeed;
+      this.longPressSpeed = settings.longPressSpeed;
+      this.playerRotation = settings.playerRotation;
+    })
     .hideTitleBar(true)
   }
 
@@ -337,6 +377,12 @@ export struct SettingsPage {
     } else if (name === 'recommend') {
       this.recommendSource = key;
       this.save({ recommendSource: key });
+    } else if (name === 'pressSpeed') {
+      this.longPressSpeed = Number(key);
+      this.save({ longPressSpeed: this.longPressSpeed });
+    } else if (name === 'rotation') {
+      this.playerRotation = key;
+      this.save({ playerRotation: key });
     } else if (name === 'speed') {
       const value = Number(key);
       if (value > 0) {

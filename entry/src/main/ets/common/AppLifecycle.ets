@@ -12,6 +12,9 @@
 export class AppLifecycle {
   private static bg: boolean = false;
 
+  /** Starting another player closes the retained in-app PiP session first. */
+  static closeInAppPiP: (() => void) | null = null;
+
   /** 当前关心前后台变化的页面挂的回调（播放页），离开时置空 */
   static bgHandler: (background: boolean) => void = () => {};
 

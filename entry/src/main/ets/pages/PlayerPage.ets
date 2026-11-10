@@ -1,4 +1,10 @@
-﻿/**
+import { SleepTimer } from '../common/SleepTimer';
+import { SleepTimerChoice, SleepTimerDialog } from '../common/SleepTimerDialog';
+import { CastBackgroundTask } from '../common/CastBackgroundTask';
+import { BusinessError } from '@kit.BasicServicesKit';
+import { DlnaProbe } from '../common/DlnaProbe';
+import { CastControl, DlnaControl, NativeCastControl } from '../common/CastControl';
+/**
  * 播放页：全屏播放（点播 / 离线缓存）、进度续播、倍速、选集、换源、自动连播
  */
 
@@ -8,7 +14,9 @@ import { AvPlayerController, PlaybackSpeedOption } from '../player/AvPlayerContr
 import { DevicePolicy } from '../common/DevicePolicy';
 import { SystemInsets } from '../common/SystemInsets';
 import { audio, AVVolumePanel } from '@kit.AudioKit';
-import { AVCastPicker, AVCastPickerStyle, AVCastPickerColorMode, avSession } from '@kit.AVSessionKit';
+import { AVCastPicker, AVCastPickerStyle, AVCastPickerColorMode, AVCastPickerState, avSession } from '@kit.AVSessionKit';
+import { CastHandoff } from '../common/CastHandoff';
+import { CastResume } from '../common/CastResume';
 import { ScreenKeeper } from '../common/ScreenKeeper';
 import { PlayUrlResolver } from '../player/PlayUrlResolver';
 import { VideoSurface } from '../player/VideoSurface';
@@ -31,6 +39,7 @@ import { ShareTarget } from '../common/ShareLink';
 import { common } from '@kit.AbilityKit';
 
 export interface PlayerPageParam {
+  restoreCast?: boolean;
   sourceKey: string;
   vodId: string;
   episode: number;
@@ -74,6 +83,19 @@ export struct PlayerPage {
   /** 播放线路下标：优先取该线路的分集 */
   lineIndex: number = 0;
 
+  @State restoreCast: boolean = false;
+  @State castRestoreStatus: string = '';
+  private castAutoRecovering: boolean = false;
+  @State showCastEpisodes: boolean = false;
+  @State castSwitchTarget: number = -1;
+  private castMediaUri: string = '';
+  private castAssetId: string = '';
+  private castSavedAt: number = 0;
+  private castSyncPending: boolean = false;
+  @State castPhase: string = '';
+  @State castPhaseError: string = '';
+  private castPollTimer: number = -1;
+
   private player: AvPlayerController = new AvPlayerController();
   private holderFile: fs.File | null = null;
   private cacheDir: string = '';
@@ -85,6 +107,8 @@ export struct PlayerPage {
   private settings: Settings = SettingsStore.shared().get();
   private starting: boolean = false;
   private released: boolean = false;
+  @StorageLink('sleepTimerLabel') sleepTimerLabel: string = '未开启';
+  private resumeTimer: number = -1;
   /** 分集加载任务：startPlay 必须等它完成，否则 episodes 还是空数组 */
   private loadTask: Promise<void> | null = null;
   /** 倍速是否已应用：只能在真正进入 playing 后再调 setSpeed，提前调会报 5400102 */
@@ -109,6 +133,7 @@ export struct PlayerPage {
   @State sliderValue: number = 0;
   @State sliderMax: number = 100;
   @State controlsVisible: boolean = true;
+  @State screenLocked: boolean = false;
   /** 点播收藏态：顶部栏星标按钮的实/空心 */
   @State favorite: boolean = false;
   @State showEpisodes: boolean = false;
@@ -122,6 +147,10 @@ export struct PlayerPage {
    * 顶部操作栏的让位量（vp）。手机 42（状态栏 38 + 4），平板按实测放大，
    * 横屏无状态栏时回到 8。见 syncTopPad()。
    */
+  private insetsWindow: window.Window | null = null;
+  private insetsChanged: (options: window.AvoidAreaOptions) => void = (options: window.AvoidAreaOptions) => {
+    if (!this.released && options.type === window.AvoidAreaType.TYPE_SYSTEM) { this.syncTopPad(); }
+  };
   @State topPadVp: number = SystemInsets.top() + 8;
 
   /** 视频真实分辨率（由 AVPlayer 的 videoSizeChange 上报） */
@@ -146,6 +175,22 @@ export struct PlayerPage {
   private volumeMaxLevel: number = 15;
   /** 投屏用的媒体会话：系统投屏列表只认有 AVSession 的应用 */
   private castSession: avSession.AVSession | null = null;
+  @State castSessionReady: boolean = false;
+  private castController: CastControl | null = null;
+  private castGeneration: number = 0;
+  @State castDeviceName: string = '';
+  @State castVolume: number = 50;
+  private castPreviousLandscape: boolean = true;
+  private castDevice: avSession.OutputDeviceInfo | null = null;
+  @State rotationMode: string = SettingsStore.shared().get().playerRotation;
+  @State pauseHintVisible: boolean = false;
+  private pauseHintTimer: number = -1;
+  private navigationIndicatorVisible: boolean = true;
+  private castUserCommandVersion: number = 0;
+  @State localResumePending: boolean = false;
+  @State showCastConnection: boolean = false;
+  @State castDisconnecting: boolean = false;
+  @State castSwitching: boolean = false;
   /** 是否已经真正起播过（用于区分「首次加载」和「播放中抖动」） */
   @State hasStarted: boolean = false;
   /** 真正控制加载圈显隐，和 buffering 解耦，防止闪一下就没 */
@@ -205,30 +250,34 @@ export struct PlayerPage {
    *  测速那几秒画面可能自己就恢复了，弹一条转瞬即逝的 toast 看着像误报 */
   @State loadingHint: string = '';
 
-  // ---------- 长按加速 / 长按左右滑快进快退 ----------
-  /** 长按已生效（正在加速播放） */
+  // ---------- 全屏横滑调进度 / 两侧长按加速 ----------
+  /** 两侧长按已生效（正在加速播放） */
   @State pressSpeed: boolean = false;
-  /** 长按后横向拖动：正在预览快进/快退目标位置 */
+  /** 正在预览滑动后的目标进度 */
   @State seekPreviewing: boolean = false;
+  @State seekPreviewVisible: boolean = false;
+  private seekPreviewTimer: number = -1;
   /** 预览目标位置（ms） */
   @State seekPreviewMs: number = 0;
-  /** 目标位置相对长按起点的偏移（ms），负数 = 快退 */
+  /** 目标位置相对滑动起点的偏移（ms），负数 = 快退 */
   @State seekDeltaMs: number = 0;
   /** 长按计时器 */
   private pressTimer: number = -1;
   /** 本次按下的起点（vp） */
   private pressDownX: number = 0;
   private pressDownY: number = 0;
-  /** 长按生效瞬间的播放位置：快进/快退都以它为原点，整段手势不累积漂移 */
+  /** 手势开始时的播放位置 */
   private seekBaseMs: number = 0;
-  /** 长按后是否已发生明显横向拖动 */
+  /** 是否已发生明显横向拖动 */
   private seekDragging: boolean = false;
+  /** 只处理从有效 Down 到 Up 的同一根手指，阻止相邻点击复用旧坐标。 */
+  private touchGestureActive: boolean = false;
+  private touchAxis: string = '';
   /** 长按后抬手要吃掉这次 click，否则会顺带把控制条呼出来 */
   private suppressTap: boolean = false;
   /** 长按加速的倍速 */
-  private static readonly PRESS_SPEED: number = 2.0;
   /** 长按判定时长（毫秒）：太短会和"轻点唤出控制条"撞车 */
-  private static readonly PRESS_DELAY_MS: number = 380;
+  private static readonly PRESS_DELAY_MS: number = 600;
   /** 横向滑满一屏对应的跳转时长（毫秒） */
   private static readonly SEEK_FULL_SPAN_MS: number = 300000;
 
@@ -245,6 +294,18 @@ export struct PlayerPage {
   /** 交给 VideoSurface 的 XComponent 控制器：创建画中画必须把它传给 PiPWindow */
   private xController: XComponentController = new XComponentController();
   private pipController: PiPWindow.PiPController | null = null;
+  private sleepTimerDialogController: CustomDialogController | undefined = undefined;
+  @State private sleepTimerDialogOpen: boolean = false;
+  private sleepTimerDialogRelayoutPending: boolean = false;
+  private sleepTimerDialogRelayoutTimer: number = -1;
+  private sleepTimerAnchorLeft: number = 0;
+  private sleepTimerAnchorRight: number = 0;
+  private sleepTimerAnchorTop: number = 0;
+  private sleepTimerAnchorBottom: number = 0;
+  @State pipAvailable: boolean = false;
+  @State pipStarting: boolean = false;
+  private pipBrowsing: boolean = false;
+  private pipBrowseLandscape: boolean = true;
   /** 正在创建控制器：避免 onSurfaceReady 与 videoSizeChange 并发各建一个 */
   private pipCreating: boolean = false;
   /** 画中画窗口是否真的在显示（由 stateChange 维护） */
@@ -266,22 +327,119 @@ export struct PlayerPage {
   /** 屏幕常亮是否由本页持有：重复进出必须配对，否则会一直亮屏 */
   private screenHeld: boolean = false;
 
+  private prepareCastRecovery(): void {
+    if (this.offlineDir !== '') { return; }
+    const snapshot = CastResume.load();
+    if (snapshot === null || snapshot.record.sourceKey !== this.sourceKey || snapshot.record.vodId !== this.vodId) { return; }
+    const record = snapshot.record;
+    this.restoreCast = true;
+    this.episode = record.episode;
+    this.currentEp = record.episode;
+    this.episodeName = record.episodeName ?? '';
+    this.episodeUrl = record.playUrl ?? '';
+    this.lineIndex = record.lineIndex ?? 0;
+    this.positionMs = record.positionMs;
+    this.durationMs = record.durationMs;
+    this.durationText = Utils.formatTime(record.durationMs);
+    this.sliderMax = Math.max(1, Math.floor(record.durationMs / 1000));
+    this.castRestoreStatus = '正在查找上次的电视并恢复遥控…';
+  }
+
+  private async autoRestoreCast(): Promise<void> {
+    const session = this.castSession;
+    const snapshot = CastResume.load();
+    if (this.castAutoRecovering || !this.restoreCast || session === null || snapshot === null) { return; }
+    this.castAutoRecovering = true;
+    const generation = this.castGeneration;
+    try {
+      const remote = await DlnaProbe.read(snapshot.deviceName);
+      if (this.released || this.castGeneration !== generation || this.castSession !== session || !this.restoreCast) { return; }
+      if (remote.mediaUri !== snapshot.mediaUri) { throw new Error('电视正在播放其他内容'); }
+      const controller = new DlnaControl(snapshot.deviceName, snapshot.mediaUri, snapshot.assetId);
+      const device: avSession.OutputDeviceInfo = { devices: [{ deviceId: snapshot.deviceId, deviceName: snapshot.deviceName,
+        deviceType: avSession.DeviceType.DEVICE_TYPE_TV, castCategory: avSession.AVCastCategory.CATEGORY_REMOTE }] };
+      this.castPreviousLandscape = this.landscape;
+      await this.connectRemote(session, device, controller);
+    } catch (e) {
+      console.warn('[cast] automatic recovery unavailable');
+      if (!this.released && this.castGeneration === generation && this.restoreCast) {
+        this.castRestoreStatus = '暂时无法自动恢复：电视可能不在线或已切换内容。可在手机播放，或使用系统投屏列表重新连接。';
+      }
+    } finally { this.castAutoRecovering = false; }
+  }
+
+  private playOnPhone(): void {
+    this.castGeneration++;
+    CastResume.clear();
+    this.restoreCast = false;
+    this.castRestoreStatus = '';
+    this.localResumePending = false;
+    this.castDevice = null;
+    this.showLoading = true;
+    this.resumePlayback(3);
+  }
+
+  private recoverCast(): boolean {
+    const parked = CastHandoff.take();
+    if (parked === null) { return false; }
+
+      if (this.vodId !== parked.record.vodId || this.sourceKey !== parked.record.sourceKey) {
+        this.toast('当前仍在投屏，已返回遥控器；断开后可在手机播放其他视频');
+      }
+      this.offlineDir = '';
+      this.castMediaUri = parked.mediaUri;
+      this.castAssetId = parked.assetId;
+      this.restoreCast = false;
+      this.castPreviousLandscape = parked.landscape;
+      this.rotationMode = parked.rotationMode;
+      this.sourceKey = parked.record.sourceKey;
+      this.vodId = parked.record.vodId;
+      this.title = parked.record.name;
+      this.pic = parked.record.pic ?? '';
+      this.episode = parked.record.episode;
+      this.episodeName = parked.record.episodeName ?? '';
+      this.episodeUrl = parked.record.playUrl ?? '';
+      this.lineIndex = parked.record.lineIndex ?? 0;
+      this.positionMs = parked.record.positionMs;
+      this.durationMs = parked.record.durationMs;
+      this.durationText = Utils.formatTime(this.durationMs);
+      this.sliderMax = Math.max(1, Math.floor(this.durationMs / 1000));
+      this.sliderValue = Math.floor(this.positionMs / 1000);
+      this.episodes = parked.episodes;
+      this.playing = parked.playing;
+      this.castVolume = parked.volume;
+      this.castSession = parked.session;
+      this.castSessionReady = true;
+      this.castController = parked.controller;
+      this.castDeviceName = parked.deviceName;
+      this.bindCastSession(parked.session);
+      this.connectRemote(parked.session, parked.device, parked.controller);
+
+    this.currentEp = this.episode;
+    return true;
+  }
+
   aboutToAppear(): void {
     // 先把顶部栏的让位量校准（缓存节点复用时靠 onShown 里的再次调用）
     this.syncTopPad();
+    AppLifecycle.closeInAppPiP?.();
+    this.localResumePending = this.restoreCast === true;
     // 播放页存活期间保持屏幕常亮：平板全屏播放时系统休眠计时一到会直接黑屏锁屏
     this.holdScreen();
+    this.bindSleepTimer();
     this.syncSystemVolume();
-    this.initCastSession();
+    const recovered = this.recoverCast();
+    if (!recovered) { this.prepareCastRecovery(); this.localResumePending = this.restoreCast === true; this.initCastSession(); }
     const hostCtx = this.getUIContext().getHostContext();
     if (hostCtx !== undefined) {
       this.cacheDir = hostCtx.filesDir + '/play';
     }
     this.currentEp = this.episode;
-    this.speedValue = this.settings.defaultSpeed;
+    this.speedValue = this.settings.rememberSpeed ? this.settings.lastSpeed : this.settings.defaultSpeed;
     this.positionText = Utils.formatTime(this.positionMs);
     // 收藏态在构造参数注入后即可读取（详情页 / 历史页都已带 sourceKey+vodId）
     this.favorite = HistoryStore.shared().isFavorite(this.sourceKey, this.vodId);
+    this.bindSleepTimer();
     this.bindCallbacks();
     // 前后台变化回调：判断画中画有没有接管，没接管就得自己停住
     AppLifecycle.bgHandler = (background: boolean) => {
@@ -289,17 +447,21 @@ export struct PlayerPage {
     };
     if (hostCtx !== undefined) {
       window.getLastWindow(hostCtx).then((win: window.Window) => {
+        if (this.released) { return; }
         this.win = win;
+        this.watchPlayerInsets(win);
       }).catch(() => {
         // ignore
       });
     }
-    if (this.offlineDir === '') {
+    if (this.offlineDir === '' && !recovered) {
       this.loadTask = this.loadEpisodes();
     }
   }
 
   aboutToDisappear(): void {
+    // Navigation caches this XComponent page while native PiP owns its surface.
+    if (this.pipBrowsing) { return; }
     // 每一件清理都单独包一层：以前是一串裸调用，前面任何一步抛错，
     // 后面的「交还窗口布局」「释放播放器」就整段被跳过 ——
     // 症状正是「已经回到列表，界面却顶到状态栏底下、声音还在放」。
@@ -388,6 +550,16 @@ export struct PlayerPage {
    * 首次进入以及「从后台回前台」时 released 都是 false，不会被误判成再次进入。
    */
   private onPageShown(): void {
+    if (this.pipBrowsing) {
+      const param = latestNavParam(this.navPathStack, 'Player') as PlayerPageParam | null;
+      if (param !== null && (param.sourceKey !== this.sourceKey || param.vodId !== this.vodId || param.episode !== this.currentEp)) {
+        this.closeBrowsingPiP();
+      } else {
+        this.restoreBrowsingPiP();
+        this.restoreFromPiP();
+        return;
+      }
+    }
     if (!this.released) {
       return;
     }
@@ -395,8 +567,8 @@ export struct PlayerPage {
     this.resetForReentry();
     // 缓存节点复用时 onSurfaceReady 不会再触发，窗口这两件事必须自己补上
     this.applyWindowFullScreen(true);
-    this.setLandscape(true);
-    this.resumePlayback(3);
+    if (this.castController !== null) { this.applyCastRotation(); }
+    else { this.applyLocalRotation(); this.resumePlayback(3); }
   }
 
   /** 从路由栈取最新参数：缓存节点复用后，构造时传入的字段还是旧的 */
@@ -406,6 +578,7 @@ export struct PlayerPage {
       return;
     }
     const p: PlayerPageParam = raw as PlayerPageParam;
+    this.restoreCast = p.restoreCast === true;
     this.sourceKey = p.sourceKey;
     this.vodId = p.vodId;
     this.episode = p.episode;
@@ -424,6 +597,15 @@ export struct PlayerPage {
   /** 把上一次留下的播放状态清干净（画面尺寸与 Surface id 保留，它们还有用） */
   private resetForReentry(): void {
     this.released = false;
+    this.localResumePending = this.restoreCast === true;
+    this.castDevice = null;
+    this.castMediaUri = '';
+    this.castAssetId = '';
+    this.castSavedAt = 0;
+    this.showCastEpisodes = false;
+    this.castRestoreStatus = '';
+    this.showCastConnection = false;
+    this.screenLocked = false;
     this.starting = false;
     this.playPending = false;
     this.restartQueued = false;
@@ -466,13 +648,16 @@ export struct PlayerPage {
     // release() 里把常亮、投播会话、前后台回调都交还了，重新进入必须再拿回来
     this.holdScreen();
     this.settings = SettingsStore.shared().get();
-    this.speedValue = this.settings.defaultSpeed;
+    this.rotationMode = this.settings.playerRotation;
+    this.speedValue = this.settings.rememberSpeed ? this.settings.lastSpeed : this.settings.defaultSpeed;
+    this.bindSleepTimer();
     this.syncSystemVolume();
-    this.initCastSession();
+    const recovered = this.recoverCast();
+    if (!recovered) { this.prepareCastRecovery(); this.localResumePending = this.restoreCast === true; this.initCastSession(); }
     AppLifecycle.bgHandler = (background: boolean) => {
       this.handleAppBackground(background);
     };
-    if (this.offlineDir === '') {
+    if (this.offlineDir === '' && !recovered) {
       this.loadTask = this.loadEpisodes();
     }
   }
@@ -483,6 +668,8 @@ export struct PlayerPage {
    * 取不到就隔 120ms 再试 —— 节点重新挂载偶尔比 onShown 晚一拍。
    */
   private resumePlayback(retries: number): void {
+    if (this.released || this.pipBrowsing) { return; }
+    if (this.resumeTimer >= 0) { clearTimeout(this.resumeTimer); this.resumeTimer = -1; }
     const sid: string = this.xController.getXComponentSurfaceId();
     if (sid !== '') {
       this.onSurfaceReady(sid);
@@ -492,7 +679,8 @@ export struct PlayerPage {
       console.warn('[player] no surface after reentry, playback not started');
       return;
     }
-    setTimeout(() => {
+    this.resumeTimer = setTimeout(() => {
+      this.resumeTimer = -1;
       this.resumePlayback(retries - 1);
     }, 120);
   }
@@ -503,6 +691,7 @@ export struct PlayerPage {
    * 底部导航贴着屏幕边，看起来像整页被拉长。
    */
   private restoreWindowState(): void {
+    this.setNavigationIndicatorVisible(true);
     this.restoreRotation();
     DevicePolicy.restoreLayout();
   }
@@ -513,6 +702,7 @@ export struct PlayerPage {
 
   private bindCallbacks(): void {
     this.player.onPrepared = (durationMs: number) => {
+      if (this.castController !== null || this.localResumePending) { return; }
       this.durationMs = durationMs;
       this.durationText = Utils.formatTime(durationMs);
       this.sliderMax = durationMs > 0 ? Math.floor(durationMs / 1000) : 100;
@@ -522,8 +712,10 @@ export struct PlayerPage {
       this.speedApplied = false;
     };
     this.player.onProgress = (positionMs: number, durationMs: number) => {
+      if (this.castController !== null || this.localResumePending) { return; }
       // 持续记录当前位置：画中画进出或画面重建导致重新 create 时，
       // startPlay 会用它做续播点；不记的话会跳回进页面时的老位置。
+      SleepTimer.check();
       this.positionMs = positionMs;
       // 进度在推进 = 没有卡顿：取消预约的检查并收掉加载圈
       if (positionMs > this.lastPosMs) {
@@ -549,6 +741,11 @@ export struct PlayerPage {
       this.maybeSaveProgress(positionMs, durationMs);
     };
     this.player.onPlayStateChanged = (playing: boolean) => {
+      if (this.castController !== null || this.localResumePending) {
+        if (playing) { this.player.pause(); }
+        return;
+      }
+      if (playing) { this.clearPauseHint(); }
       this.playing = playing;
       this.syncCastPlayback(playing);
       this.syncPiPControl(playing);
@@ -579,24 +776,18 @@ export struct PlayerPage {
       }
     };
     this.player.onCompleted = () => {
-      this.saveProgress();
-      if (this.settings.autoNext && this.currentEp + 1 < this.episodes.length) {
-        this.currentEp = this.currentEp + 1;
-        this.positionMs = 0;
-        this.positionText = '00:00';
-        this.sliderValue = 0;
-        this.startPlay();
-      } else {
-        this.controlsVisible = true;
-      }
+      if (this.castController !== null || this.localResumePending) { return; }
+      this.completePlayback();
     };
     this.player.onError = (message: string) => {
+      if (this.castController !== null || this.localResumePending) { return; }
       this.errorText = message;
       this.buffering = false;
       this.clearStall();
       this.clearWatchdog();
     };
     this.player.onBuffering = (percent: number) => {
+      if (this.castController !== null || this.localResumePending) { return; }
       this.buffering = percent < 100;
       if (percent >= 100) {
         this.clearLoadingTimer();
@@ -619,6 +810,7 @@ export struct PlayerPage {
       }
     };
     this.player.onVideoSize = (width: number, height: number) => {
+      if (this.castController !== null || this.localResumePending) { return; }
       this.videoW = width;
       this.videoH = height;
       this.updateSurfaceSize();
@@ -925,6 +1117,7 @@ export struct PlayerPage {
    *  false = 失败，或被守卫挡下（此时看 startRan 区分）
    */
   private async startPlay(): Promise<boolean> {
+    this.clearPauseHint();
     if (this.starting || this.playPending || this.released) {
       // 起播进行中又来了换集/换源请求：记入队列，本轮完成后自动重起。
       // 静默丢弃会让用户以为「点了没反应」，还可能诱发交错起播的竞态。
@@ -949,6 +1142,8 @@ export struct PlayerPage {
   }
 
   private async doStartPlay(): Promise<boolean> {
+    if (this.restoreCast) { return false; }
+    if (this.castController !== null) { return await this.startRemotePlayback(); }
     this.errorText = '';
     this.loadingHint = '';
     // 换集/换源/重试都是「重新起播」：回到未起播状态，加载圈立即出现，
@@ -1006,6 +1201,7 @@ export struct PlayerPage {
     this.starting = true;
     this.buffering = true;
     const resolved = await PlayUrlResolver.resolve(ep.url, this.settings.adFilter, this.cacheDir);
+    if (this.released || this.castController !== null || this.localResumePending) { return false; }
     this.holderFile = resolved.file;
     // 让用户看得见广告过滤在工作；为 0 时不打扰（该源本来就没插广告）
     if (resolved.filteredCount > 0) {
@@ -1110,16 +1306,16 @@ export struct PlayerPage {
     // "离线续播"因此永远没有起点，从下载页进去只能从 00:00 开始。
     // 记录字段（sourceKey/vodId/episode/positionMs）在线与离线共用一套，
     // 顺带让首页「继续观看」也能反映离线看到哪儿了。
-    if (!this.settings.playHistoryEnabled) {
+    if (this.restoreCast || !this.settings.playHistoryEnabled) {
       return;
     }
     // 播放器已经释放时 currentTime() 恒为 0：back() 里刚存好的续播点会被
     // aboutToDisappear 这一轮再写一次冲成 00:00。没有播放器又没给明确位置就跳过。
-    if (positionMs < 0 && !this.player.isCreated()) {
+    if (positionMs < 0 && !this.player.isCreated() && this.castController === null && !this.localResumePending) {
       return;
     }
-    const pos = positionMs >= 0 ? positionMs : this.player.currentTime();
-    const dur = durationMs >= 0 ? durationMs : this.player.duration();
+    const pos = positionMs >= 0 ? positionMs : (this.castController !== null || this.localResumePending ? this.positionMs : this.player.currentTime());
+    const dur = durationMs >= 0 ? durationMs : (this.castController !== null || this.localResumePending ? this.durationMs : this.player.duration());
     const ep = this.playableEpisode();
     HistoryStore.shared().saveProgress({
       sourceKey: this.sourceKey,
@@ -1180,10 +1376,14 @@ export struct PlayerPage {
   }
 
   private release(): void {
+    this.clearPauseHint();
     if (this.released) {
       return;
     }
     this.released = true;
+    if (CastHandoff.peek() === null) { SleepTimer.cancel(); SleepTimer.action = null; }
+    if (this.resumeTimer >= 0) { clearTimeout(this.resumeTimer); this.resumeTimer = -1; }
+    this.unwatchPlayerInsets();
     this.player.release();
     this.dropScreen();
     if (this.holderFile !== null) {
@@ -1214,25 +1414,45 @@ export struct PlayerPage {
     }
   }
 
+  private dismissPlayerControls(): void {
+    this.showSpeeds = false;
+    this.showEpisodes = false;
+    this.showSources = false;
+    this.controlsVisible = false;
+  }
+
+  private closePlayerPanels(): void {
+    this.showSpeeds = false;
+    this.showEpisodes = false;
+    this.showSources = false;
+    if (!this.released && this.controlsVisible) { this.scheduleHideControls(); }
+  }
+
   private scheduleHideControls(): void {
     if (this.hideTimer >= 0) {
       clearTimeout(this.hideTimer);
     }
     this.hideTimer = setTimeout(() => {
-      if (this.playing) {
-        this.controlsVisible = false;
+      if ((this.playing || this.screenLocked) && !this.showSpeeds && !this.showEpisodes && !this.showSources) {
+        this.dismissPlayerControls();
       }
-    }, 4000);
+    }, 3000);
   }
 
   private onSurfaceReady(surfaceId: string): void {
+    if (this.released || this.pipBrowsing) { return; }
     if (surfaceId === '') {
+      return;
+    }
+    if (this.restoreCast || this.castController !== null || this.localResumePending) {
+      this.surfaceId = surfaceId;
+      this.surfaceReady = true;
       return;
     }
     // 先让内容区变成整屏，再切横屏：顺序反了会先按竖屏安全区算一次尺寸
     this.applyWindowFullScreen(true);
     // 一进入播放页就切横屏（视频类应用的标准行为），退出全屏再切回竖屏
-    this.setLandscape(true);
+    this.applyLocalRotation();
     if (this.released) {
       // 已经在退场路上（release 之后面才回来）：不要再建播放器
       return;
@@ -1265,8 +1485,64 @@ export struct PlayerPage {
     // 画面销毁时不释放播放器（页面生命周期统一管理）
   }
 
-  private togglePlay(): void {
+  private handleVideoTap(): void {
+    // 长按后抬手不该顺带把控制条呼出来
+    if (this.castDeviceName !== '') { return; }
+    if (this.screenLocked) {
+      this.controlsVisible = !this.controlsVisible;
+      if (this.controlsVisible) { this.scheduleHideControls(); }
+      return;
+    }
+    if (this.suppressTap) {
+      this.suppressTap = false;
+      return;
+    }
+    if (!this.controlsVisible) {
+      this.controlsVisible = true;
+      this.scheduleHideControls();
+    } else {
+      this.dismissPlayerControls();
+    }
+  }
+
+  private handleVideoDoubleTap(): void {
+    if (this.released || this.screenLocked || this.castController !== null ||
+      this.castDeviceName !== '' || this.restoreCast || this.localResumePending || this.pipActive) { return; }
+    if (this.suppressTap) { this.suppressTap = false; return; }
+    const wasPlaying: boolean = this.playing;
     this.player.toggle();
+    this.clearPauseHint();
+    if (wasPlaying) {
+      this.pauseHintVisible = true;
+      this.pauseHintTimer = setTimeout(() => { this.pauseHintVisible = false; this.pauseHintTimer = -1; }, 1000);
+    }
+    if (this.controlsVisible) { this.scheduleHideControls(); }
+  }
+
+  private clearPauseHint(): void {
+    if (this.pauseHintTimer >= 0) { clearTimeout(this.pauseHintTimer); this.pauseHintTimer = -1; }
+    this.pauseHintVisible = false;
+  }
+
+  private rotationIcon(): Resource {
+    return this.rotationMode === 'landscape' ? $r('app.media.ic_player_direction_landscape')
+      : this.rotationMode === 'portrait' ? $r('app.media.ic_player_direction_portrait')
+      : this.rotationMode === 'system' ? $r('app.media.ic_player_direction_system')
+      : $r('app.media.ic_player_rotation');
+  }
+
+  private togglePlay(): void {
+    this.clearPauseHint();
+    if (this.restoreCast) { return; }
+    if (this.castController !== null) {
+      this.castCommand(this.playing ? 'pause' : 'play');
+    } else if (this.localResumePending) {
+      this.localResumePending = false;
+      if (this.player.isCreated()) { this.initPiP(); this.startPlay(); }
+      else { this.resumePlayback(3); }
+    } else {
+      this.player.toggle();
+    }
     this.controlsVisible = true;
     this.scheduleHideControls();
   }
@@ -1292,7 +1568,8 @@ export struct PlayerPage {
   private onSliderChange(value: number, mode: SliderChangeMode): void {
     if (mode === SliderChangeMode.End) {
       const target: number = value * 1000;
-      this.player.seekTo(target);
+      if (this.castController !== null) { this.castCommand('seek', target); }
+      else { this.player.seekTo(target); }
       this.applySeekUi(target);
     }
   }
@@ -1314,6 +1591,11 @@ export struct PlayerPage {
       this.showEpisodes = false;
       return;
     }
+    if (this.castController !== null) {
+      this.selectRemoteEpisode(idx);
+      return;
+    }
+    this.localResumePending = false;
     this.currentEp = idx;
     this.positionMs = 0;
     this.positionText = '00:00';
@@ -1324,8 +1606,10 @@ export struct PlayerPage {
 
   private selectSpeed(speed: number): void {
     this.speedValue = speed;
-    this.player.setSpeed(speed);
-    this.showSpeeds = false;
+    if (this.settings.rememberSpeed) { SettingsStore.shared().update({ lastSpeed: speed }); }
+    if (this.castController !== null) { this.castCommand('setSpeed', speed); }
+    else { this.player.setSpeed(speed); }
+    this.closePlayerPanels();
   }
 
   private async runSpeedTest(): Promise<void> {
@@ -1334,6 +1618,8 @@ export struct PlayerPage {
     }
     this.speedTesting = true;
     this.showSources = true;
+    this.showSpeeds = false;
+    this.showEpisodes = false;
     const items = await SearchService.speedTest(this.title, this.sourceKey, this.settings);
     this.speedItems = items;
     this.speedTesting = false;
@@ -1632,13 +1918,10 @@ export struct PlayerPage {
     return 0;
   }
 
-  /**
-   * 一次「划过约 60% 屏高」覆盖 0→100%。
-   * 屏幕越大越难一划到底，所以按实测高度取比例，而不是写死一个 vp 值。
-   */
+  /** 音量在 40% 屏高内覆盖全程，亮度在 60% 屏高内覆盖全程。 */
   private adjustRange(): number {
     const h: number = this.canvasH > 0 ? this.canvasH : 640;
-    return h * 0.6;
+    return h * (this.adjustKind === 'volume' ? 0.4 : 0.6);
   }
 
   private clearAdjustTimer(): void {
@@ -1659,10 +1942,15 @@ export struct PlayerPage {
     }
     try {
       const s = await avSession.createAVSession(ctx, 'libretv_player', 'video');
+      if (this.released || this.castSession !== null) {
+        await s.destroy();
+        return;
+      }
       this.castSession = s;
-      await s.activate();
+      this.castSessionReady = false;
       const md: avSession.AVMetadata = {
         assetId: this.vodId !== '' ? this.vodId : 'unknown',
+        filter: avSession.ProtocolType.TYPE_CAST_PLUS_STREAM | avSession.ProtocolType.TYPE_DLNA,
         title: this.title !== '' ? this.title : Brand.displayName(this.getUIContext())
       };
       await s.setAVMetadata(md);
@@ -1670,14 +1958,113 @@ export struct PlayerPage {
       // 不声明时系统按普通音频会话处理，列表只剩音频输出设备（本次反馈的现象）
       const extras: Record<string, Object> = { 'requireAbilityList': ['url-cast'] };
       await s.setExtras(extras);
+      this.bindCastSession(s);
+      await s.setAVPlaybackState({
+        state: this.playing ? avSession.PlaybackState.PLAYBACK_STATE_PLAY : avSession.PlaybackState.PLAYBACK_STATE_PAUSE,
+        position: { elapsedTime: this.positionMs, updateTime: Date.now() }, duration: this.durationMs
+      });
+      await s.activate();
+      if (this.released || this.castSession !== s) { await s.destroy(); return; }
+      this.castSessionReady = true;
+      console.info('[cast] session ready restore=' + this.restoreCast);
+      if (this.restoreCast) { this.autoRestoreCast(); }
     } catch (e) {
+      console.error('[cast] session initialization failed: ' + JSON.stringify(e));
+      const failed = this.castSession;
       this.castSession = null;
+      this.castSessionReady = false;
+      failed?.destroy().catch(() => {});
+      if (this.restoreCast && !this.released) { this.castRestoreStatus = '投屏连接准备失败，请点击重试连接'; }
     }
   }
 
+  private bindCastSession(s: avSession.AVSession): void {
+      s.on('outputDeviceChange', (state: avSession.ConnectionState, device: avSession.OutputDeviceInfo) => {
+        if (this.castSession !== s || this.released || this.castController?.direct === true) { return; }
+        const remote = device.devices.some((d: avSession.DeviceInfo) =>
+          d.castCategory === avSession.AVCastCategory.CATEGORY_REMOTE);
+        console.info('[cast] output state=' + state + ' remote=' + remote);
+        if (state === avSession.ConnectionState.STATE_CONNECTED && remote) {
+          this.connectRemote(s, device);
+        } else if (state === avSession.ConnectionState.STATE_DISCONNECTED || !remote) {
+          if (this.castController === null) { return; }
+          this.finishCastDisconnect();
+        }
+      });
+  }
+
+  private finishCastDisconnect(): void {
+    CastBackgroundTask.stop().catch(() => {});
+    this.castGeneration++;
+    this.castPhase = '';
+    this.castPhaseError = '';
+    this.castSyncPending = false;
+    if (this.castPollTimer >= 0) { clearTimeout(this.castPollTimer); this.castPollTimer = -1; }
+    this.showCastEpisodes = false;
+    this.showCastConnection = false;
+    this.restoreCast = false;
+    this.screenLocked = false;
+    this.dismissPlayerControls();
+    if (this.hideTimer >= 0) { clearTimeout(this.hideTimer); this.hideTimer = -1; }
+    this.castController?.off('playbackStateChange');
+    this.castController?.off('error');
+    this.castController = null;
+    this.castDeviceName = '';
+    this.applyLocalRotation();
+    this.holdScreen();
+    this.controlsVisible = true;
+    this.playing = false;
+    this.localResumePending = true;
+    this.hasStarted = true;
+    this.showLoading = false;
+    this.buffering = false;
+    this.errorText = '';
+    this.player.pause();
+    this.saveProgress(this.positionMs, this.durationMs);
+    this.castDevice = null;
+  }
+
+  private async disconnectCast(): Promise<void> {
+    const session = this.castSession;
+    const controller = this.castController;
+    if (session === null || controller === null || this.castDisconnecting) { return; }
+    this.castDisconnecting = true;
+    try {
+    console.info('[cast] disconnect requested');
+    this.player.pause();
+    // Stop playback before giving the output route back to the phone.
+    try {
+      await controller.sendControlCommand({ command: 'stop' });
+      if (!controller.direct) { await session.stopCasting(); }
+      controller.off('playbackStateChange');
+      controller.off('error');
+      if (this.castController === controller) { this.finishCastDisconnect(); }
+      CastResume.clear();
+      console.info('[cast] disconnect completed');
+    } catch (e) {
+      console.error('[cast] disconnect failed: ' + JSON.stringify(e));
+      this.getUIContext().getPromptAction().showDialog({
+        title: '未能确认电视已停止',
+        message: '电视可能仍在播放。可以保留遥控后重试，或仅退出遥控，电视可能继续播放。',
+        buttons: [{ text: '保留遥控', color: '#808080' }, { text: '仅退出遥控', color: '#E34D59' }]
+      }).then((result) => {
+        if (result.index === 1 && !this.released && this.castController === controller) { this.back(); }
+      }).catch(() => {});
+    }
+    } finally { this.castDisconnecting = false; }
+  }
+
   private releaseCastSession(): void {
+    if (this.castPollTimer >= 0) { clearTimeout(this.castPollTimer); this.castPollTimer = -1; }
+    this.castSyncPending = false;
     const s = this.castSession;
     this.castSession = null;
+    this.castSessionReady = false;
+    this.castGeneration++;
+    this.castController?.off('playbackStateChange');
+    this.castController?.off('error');
+    this.castController = null;
+    this.castDeviceName = '';
     if (s !== null) {
       s.destroy().catch(() => {
         // 忽略
@@ -1685,10 +2072,290 @@ export struct PlayerPage {
     }
   }
 
+  private completePlayback(): void {
+    this.saveProgress();
+    if (SleepTimer.completed()) { return; }
+    if (this.settings.autoNext && this.currentEp + 1 < this.episodes.length) {
+      this.selectEpisode(this.currentEp + 1);
+    } else {
+      this.controlsVisible = true;
+    }
+  }
+
+  private async connectRemote(session: avSession.AVSession, device: avSession.OutputDeviceInfo, recovered: CastControl | null = null): Promise<void> {
+    this.clearPauseHint();
+    this.releasePiP();
+    const generation = ++this.castGeneration;
+    const localStart = this.positionMs;
+    try {
+      if (this.offlineDir !== '') { throw new Error('离线缓存暂不支持电视投播'); }
+      console.info('[cast] acquiring remote controller');
+      let controller: CastControl = recovered !== null ? recovered : new NativeCastControl(await session.getAVCastController());
+      if (generation !== this.castGeneration || this.released) { return; }
+      let resumedState: avSession.AVPlaybackState | null = null;
+      const previous = CastResume.load();
+      if (recovered === null && !this.restoreCast && CastResume.isFromPreviousRun() && previous !== null &&
+        previous.record.sourceKey === this.sourceKey && previous.record.vodId === this.vodId && previous.record.episode === this.currentEp &&
+        device.devices.some((d: avSession.DeviceInfo) => d.deviceId === previous.deviceId || d.deviceName === previous.deviceName)) {
+        this.restoreCast = true;
+      }
+      if (this.restoreCast) {
+        this.player.pause();
+        this.localResumePending = true;
+        console.info('[cast] restoring existing remote playback');
+        this.castDevice = device;
+        this.castRestoreStatus = '正在读取电视播放状态…';
+        const snapshot = CastResume.load();
+        const remote = device.devices.find((d: avSession.DeviceInfo) => d.castCategory === avSession.AVCastCategory.CATEGORY_REMOTE);
+        if (snapshot === null || remote === undefined) { throw new Error('没有可恢复的投屏记录'); }
+        resumedState = await CastResume.read(controller, snapshot, remote.deviceId, remote.deviceName);
+        if (generation !== this.castGeneration || this.released) { return; }
+        this.castMediaUri = snapshot.mediaUri;
+        this.castAssetId = snapshot.assetId;
+        // A cached system controller may report success while no longer routing commands.
+        if (!controller.direct) {
+          try {
+            const dlna = await DlnaProbe.read(snapshot.deviceName);
+            if (dlna.mediaUri === snapshot.mediaUri) { controller = new DlnaControl(snapshot.deviceName, snapshot.mediaUri, snapshot.assetId); }
+          } catch (e) { console.info('[cast] keeping system cast controller'); }
+        }
+      }
+      if (generation !== this.castGeneration || this.released) { return; }
+      this.releasePiP();
+      this.localResumePending = false;
+      this.castSyncPending = recovered === null && resumedState === null;
+      this.castController = controller;
+      if (SleepTimer.selectedMinutes() !== -999) {
+        const context = this.getUIContext().getHostContext() as common.UIAbilityContext | undefined;
+        if (context !== undefined) {
+          CastBackgroundTask.start(context).catch(() => {
+            SleepTimer.cancel();
+            this.toast('后台计时未能启动，请保持应用在前台');
+          });
+        }
+      }
+      this.errorText = '';
+      if (recovered === null) { this.castPreviousLandscape = this.landscape; }
+      this.castDevice = device;
+      this.castDeviceName = device.devices.length > 0 ? device.devices[0].deviceName : '电视';
+      this.applyCastRotation();
+      controller.on('playbackStateChange', 'all', (state: avSession.AVPlaybackState) => {
+        if (this.castController !== controller || this.released || this.castDisconnecting || this.castSyncPending || this.castSwitching) { return; }
+        if (state.state !== undefined) {
+          this.playing = state.state === avSession.PlaybackState.PLAYBACK_STATE_PLAY;
+          if (state.state === avSession.PlaybackState.PLAYBACK_STATE_COMPLETED) {
+            this.completePlayback();
+            return;
+          }
+        }
+        if (state.volume !== undefined) { this.castVolume = state.volume; }
+        if (state.duration !== undefined && state.duration > 0) {
+          this.durationMs = state.duration;
+          this.durationText = Utils.formatTime(state.duration);
+          this.sliderMax = Math.max(1, Math.floor(state.duration / 1000));
+        }
+        if (state.position !== undefined) {
+          this.applySeekUi(state.position.elapsedTime);
+          this.sliderValue = Math.floor(this.positionMs / 1000);
+          this.maybeSaveProgress(this.positionMs, this.durationMs);
+          this.rememberCast();
+        }
+      });
+      controller.on('error', (error: BusinessError) => {
+        if (this.castController !== controller || this.released || this.castDisconnecting) { return; }
+        if (error.code === 6600001) {
+          this.finishCastDisconnect();
+          this.toast('电视连接已丢失，可在手机继续播放或重新连接电视');
+        } else { this.toast('电视播放失败，请换源或检查电视网络'); }
+      });
+      this.screenLocked = false;
+      this.showSpeeds = false;
+      this.showEpisodes = false;
+      this.showSources = false;
+      this.endPress(true);
+      this.endAdjust();
+      this.player.pause();
+      this.clearWatchdog();
+      this.clearLoadingTimer();
+      this.clearResync();
+      this.clearStall();
+      if (resumedState !== null) {
+        this.restoreCast = false;
+        this.localResumePending = false;
+        this.durationMs = resumedState.duration ?? this.durationMs;
+        this.durationText = Utils.formatTime(this.durationMs);
+        this.sliderMax = Math.max(1, Math.floor(this.durationMs / 1000));
+        this.applySeekUi(resumedState.position!.elapsedTime);
+        this.playing = resumedState.state === avSession.PlaybackState.PLAYBACK_STATE_PLAY;
+        if (resumedState.volume !== undefined) { this.castVolume = resumedState.volume; }
+        this.hasStarted = true;
+        this.showLoading = false;
+        this.buffering = false;
+        this.rememberCast(true);
+        this.dropScreen();
+      } else if (recovered === null) {
+        if (!await this.startRemotePlayback(this.currentEp, localStart)) { await session.stopCasting(); }
+      } else { this.hasStarted = true; this.dropScreen(); }
+      this.startCastPolling();
+    } catch (e) {
+      if (generation !== this.castGeneration || this.released) { return; }
+      console.error('[cast] connect failed: ' + JSON.stringify(e));
+      if (this.restoreCast) {
+        this.castRestoreStatus = '无法恢复遥控：请确认选择原来的电视、仍在播放同一内容，且电视支持读取播放状态。可以重选设备，或选择重新投播。';
+        return;
+      }
+      this.toast('投播连接失败，请重新选择设备');
+      this.castController = null;
+      this.castDeviceName = '';
+      session.stopCasting().catch(() => {});
+    }
+  }
+
+  private applyCastState(state: avSession.AVPlaybackState): void {
+    if (state.duration !== undefined && state.duration > 0) {
+      this.durationMs = state.duration;
+      this.durationText = Utils.formatTime(state.duration);
+      this.sliderMax = Math.max(1, Math.floor(state.duration / 1000));
+    }
+    if (state.position !== undefined) { this.applySeekUi(state.position.elapsedTime); }
+    if (state.volume !== undefined) { this.castVolume = state.volume; }
+    if (state.state !== undefined) { this.playing = state.state === avSession.PlaybackState.PLAYBACK_STATE_PLAY; }
+  }
+
+  private startCastPolling(): void {
+    if (this.castPollTimer >= 0) { clearTimeout(this.castPollTimer); }
+    if (this.castController?.direct === true) { return; }
+    this.castPollTimer = setTimeout(async () => {
+      this.castPollTimer = -1;
+      const controller = this.castController;
+      const generation = this.castGeneration;
+      if (controller === null || this.released) { return; }
+      const uri = this.castMediaUri;
+      const asset = this.castAssetId;
+      try {
+        if (!this.castDisconnecting && !this.castSyncPending && !this.castSwitching && uri) {
+          const state = await CastResume.current(controller, uri, asset, this.castDeviceName);
+          if (this.castGeneration === generation && this.castController === controller && this.castAssetId === asset && !this.castDisconnecting && !this.castSyncPending && !this.castSwitching) {
+            this.applyCastState(state);
+            this.rememberCast();
+          }
+        }
+      } catch (e) { console.warn('[cast] remote polling unavailable'); }
+      if (this.castGeneration === generation && this.castController === controller && !this.released) { this.startCastPolling(); }
+    }, 2500);
+  }
+
+  private rememberCast(force: boolean = false): void {
+    if (this.castDevice === null || !this.castMediaUri || this.castSwitching && !force) { return; }
+    if (!force && Date.now() - this.castSavedAt < 5000) { return; }
+    const device = this.castDevice.devices.find((d: avSession.DeviceInfo) => d.castCategory === avSession.AVCastCategory.CATEGORY_REMOTE);
+    if (device === undefined) { return; }
+    const ep = this.playableEpisode();
+    CastResume.save({ deviceId: device.deviceId, deviceName: device.deviceName,
+      mediaUri: this.castMediaUri, assetId: this.castAssetId,
+      record: { sourceKey: this.sourceKey, vodId: this.vodId, name: this.title,
+        pic: this.resolvePic(), sourceName: this.infoSourceName(), episode: this.currentEp,
+        episodeName: ep !== null ? ep.name : this.episodeName,
+        playUrl: ep !== null ? ep.url : this.episodeUrl, lineIndex: this.lineIndex,
+        positionMs: this.positionMs, durationMs: this.durationMs, updatedAt: Date.now() }
+    });
+    this.castSavedAt = Date.now();
+  }
+
+  private async selectRemoteEpisode(index: number): Promise<void> {
+    if (this.castSwitching || index < 0 || index >= this.episodes.length) { return; }
+    this.castSwitching = true;
+    this.castSwitchTarget = index;
+    this.showCastEpisodes = false;
+    this.showEpisodes = false;
+    try { await this.startRemotePlayback(index); }
+    finally { this.castSwitching = false; this.castSwitchTarget = -1; }
+  }
+
+  private async startRemotePlayback(index: number = this.currentEp, requestedPosition: number = this.positionMs): Promise<boolean> {
+    const controller = this.castController;
+    if (controller === null) { return false; }
+    const switching = index !== this.currentEp;
+    const targetMs = switching ? 0 : requestedPosition;
+    const commandVersion = this.castUserCommandVersion;
+    this.castSyncPending = true;
+    this.castPhaseError = '';
+    this.castPhase = switching ? '正在准备下一集…' : '正在准备视频…';
+    try {
+      await this.ensureEpisodesLoaded();
+      const ep = switching ? (this.episodes[index] ?? null) : this.playableEpisode();
+      if (ep === null) { throw new Error('没有视频地址'); }
+      // 电视独立拉流：不能把手机的 fd:// 或回环缓存地址交给电视。
+      const url = await PlayUrlResolver.resolveSharePage(ep.url);
+      if (this.castController !== controller || this.released) { return false; }
+      if (!/^https?:\/\//i.test(url)) { throw new Error('不支持的投播地址'); }
+      const description: avSession.AVMediaDescription = {
+        assetId: 'libretv:' + this.sourceKey + ':' + this.vodId + ':' + index, title: this.title,
+        mediaUri: url, mediaType: 'VIDEO', startPosition: targetMs,
+        duration: switching ? 0 : this.durationMs
+      };
+      const item: avSession.AVQueueItem = { itemId: index, description: description };
+      console.info('[cast] preparing remote video');
+      await controller.prepare(item);
+      if (this.castController !== controller || this.released) { return false; }
+      this.castPhase = '正在等待电视起播…';
+      console.info('[cast] starting remote video');
+      await controller.start(item);
+      if (this.castController !== controller || this.released) { return false; }
+      if (switching) {
+        this.currentEp = index;
+        this.durationMs = 0;
+        this.durationText = '00:00';
+        this.sliderMax = 100;
+        this.applySeekUi(0);
+      }
+      this.errorText = '';
+      this.showLoading = false;
+      this.buffering = false;
+      this.hasStarted = true;
+      this.dropScreen();
+      this.playing = true;
+      this.castMediaUri = url;
+      this.castAssetId = description.assetId;
+      const alive = (): boolean => this.castController === controller && !this.released && this.castAssetId === description.assetId;
+      const state = await CastResume.synchronize(controller, url, description.assetId, this.castDeviceName, targetMs, alive,
+        () => this.castUserCommandVersion === commandVersion,
+        () => { if (alive()) { this.castPhase = '正在恢复至 ' + Utils.formatTime(targetMs) + '…'; } });
+      if (!alive()) { return false; }
+      if (state !== null) {
+        this.applyCastState(state);
+        if (this.castUserCommandVersion === commandVersion && targetMs > 0 && Math.abs((state.position?.elapsedTime ?? 0) - targetMs) > 5000) {
+          this.castPhaseError = '进度未恢复，请手动调整';
+          this.toast('电视未能恢复到原进度，可尝试拖动进度条');
+        }
+      }
+      if (state === null) { this.castPhaseError = '暂未确认电视播放状态'; }
+      this.rememberCast(true);
+      return true;
+    } catch (e) {
+      console.error('[cast] remote playback failed: ' + JSON.stringify(e));
+      if (this.castController === controller && !this.released) { this.castPhaseError = '投播失败，请重试或换源'; }
+      this.toast('电视无法播放此视频，请换源；部分源不允许电视直接访问');
+      return false;
+    } finally {
+      if (this.castController === controller) { this.castSyncPending = false; this.castPhase = ''; }
+    }
+  }
+
+  private castCommand(command: avSession.AVCastControlCommandType, parameter?: number): void {
+    const controller = this.castController;
+    if (controller !== null) {
+      if (command === 'seek' || command === 'pause' || command === 'play') { this.castUserCommandVersion++; }
+      controller.sendControlCommand({ command: command, parameter: parameter }).catch(() => {
+        this.toast('电视控制失败，请检查连接');
+      });
+    }
+  }
+
   /** 把播放状态同步给投播会话：播控中心/远端设备靠它显示与控制 */
   private syncCastPlayback(playing: boolean): void {
     const s = this.castSession;
-    if (s === null) {
+    if (s === null || this.castController !== null) {
       return;
     }
     try {
@@ -1726,10 +2393,16 @@ export struct PlayerPage {
 
   /** 开始滑动：按落点左右分出调音量还是调亮度，并记下基准值 */
   private beginAdjust(x: number): void {
-    const half: number = this.canvasW > 0 ? this.canvasW / 2 : 0;
-    const kind: string = x > half ? 'brightness' : 'volume';
+    if (this.pressSpeed || this.touchAxis === 'horizontal') { this.adjustKind = ''; return; }
+    const width: number = this.canvasW > 0 ? this.canvasW : 0;
+    const fifth: number = width / 5;
+    if (width <= 0 || (x >= fifth && x <= fifth * 4)) {
+      this.adjustKind = '';
+      return;
+    }
+    const kind: string = x < fifth ? 'brightness' : 'volume';
     this.clearAdjustTimer();
-    // 右半屏 = 亮度，左半屏 = 音量
+    // 左侧五分之一 = 亮度，中间五分之三 = 进度，右侧五分之一 = 音量
     if (kind === 'volume') {
       // 音量基准取系统当前值：之前调的是播放器内部音量，
       // 上限被手机预先设定的系统音量卡死，怎么滑都不会更响。
@@ -1744,7 +2417,7 @@ export struct PlayerPage {
 
   /** 滑动中：offsetY 往上滑是负的，取反后「往上」= 变大 */
   private updateAdjust(offsetY: number): void {
-    if (this.adjustKind === '') {
+    if (this.pressSpeed || this.touchAxis === 'horizontal' || this.adjustKind === '') {
       return;
     }
     const range: number = this.adjustRange();
@@ -1864,10 +2537,13 @@ export struct PlayerPage {
    * 只在本页开启，离开立刻复原 —— 首页/其它页仍走系统默认安全区，不受影响。
    */
   private applyWindowFullScreen(on: boolean): void {
+    if (this.released) { return; }
+    this.setNavigationIndicatorVisible(!on);
     // 优先用进页面时就缓存好的主窗口：会话期间 getLastWindow 可能拿不到，
     // 而窗口布局一旦没设上，整页内容就会画到状态栏与导航条底下。
     const cached: window.Window | null = this.win;
     if (cached !== null) {
+      this.watchPlayerInsets(cached);
       try {
         cached.setWindowLayoutFullScreen(on).catch(() => {
           // 个别系统版本/分屏场景会拒绝，忽略即可，不影响播放
@@ -1882,6 +2558,9 @@ export struct PlayerPage {
       return;
     }
     window.getLastWindow(context).then((win: window.Window) => {
+      if (this.released) { return; }
+      this.win = win;
+      this.watchPlayerInsets(win);
       win.setWindowLayoutFullScreen(on).catch(() => {
         // 个别系统版本/分屏场景会拒绝，忽略即可，不影响播放
       });
@@ -1890,31 +2569,25 @@ export struct PlayerPage {
     });
   }
 
+  private async setNavigationIndicatorVisible(visible: boolean): Promise<void> {
+    this.navigationIndicatorVisible = visible;
+    try {
+      let win: window.Window | null = this.win;
+      if (win === null) {
+        const context = this.getUIContext().getHostContext();
+        if (context === undefined) { return; }
+        win = await window.getLastWindow(context);
+      }
+      if (this.navigationIndicatorVisible !== visible) { return; }
+      await win.setSpecificSystemBarEnabled('navigationIndicator', visible, false);
+    } catch (e) {
+      console.warn('[player] navigation indicator update unavailable');
+    }
+  }
+
   private setLandscape(on: boolean): void {
     this.landscape = on;
-    // 方向一变，状态栏可能整条出现或收起：先测一次，转完（系统异步）再补一次
-    this.syncTopPad();
-    setTimeout(() => {
-      this.syncTopPad();
-    }, 500);
-    const context = this.getUIContext().getHostContext();
-    if (context === undefined) {
-      return;
-    }
-    window.getLastWindow(context).then((win: window.Window) => {
-      if (on) {
-        // 播放页显式接管方向：挂起 DevicePolicy 的窗口尺寸自动纠正，避免互抢
-        DevicePolicy.suppressed = true;
-        win.setPreferredOrientation(window.Orientation.AUTO_ROTATION_LANDSCAPE);
-      } else {
-        // 退出全屏必须**强制竖屏**，不能交给系统自动判断：
-        // 平板横着拿的时候，AUTO_ROTATION 的目标方向仍然是横屏，
-        // 点下去画面一点变化都没有，按钮看起来就像失效了。
-        win.setPreferredOrientation(window.Orientation.PORTRAIT);
-      }
-    }).catch(() => {
-      // 忽略窗口操作失败
-    });
+    this.applyLocalRotation(on ? 'landscape' : 'portrait');
   }
 
   /**
@@ -1924,8 +2597,27 @@ export struct PlayerPage {
    * 全屏播放时收藏、分享这一排会压在时间与电量上。横屏时系统若把状态栏
    * 收起来（实测 0），退到 8，与改之前的表现一致。
    */
+  private watchPlayerInsets(win: window.Window): void {
+    if (this.insetsWindow !== win) {
+      this.unwatchPlayerInsets();
+      try {
+        win.on('avoidAreaChange', this.insetsChanged);
+        this.insetsWindow = win;
+      } catch (e) { console.warn('[player] safe area listener unavailable'); }
+    }
+    this.syncTopPad();
+  }
+
+  private unwatchPlayerInsets(): void {
+    const win = this.insetsWindow;
+    this.insetsWindow = null;
+    if (win !== null) {
+      try { win.off('avoidAreaChange', this.insetsChanged); } catch (e) {}
+    }
+  }
+
   private syncTopPad(): void {
-    const measured: number = SystemInsets.measureTopVp(DevicePolicy.currentWindow());
+    const measured: number = SystemInsets.measureTopVp(this.win ?? DevicePolicy.currentWindow());
     if (measured < 0) {
       return;
     }
@@ -1954,6 +2646,31 @@ export struct PlayerPage {
   }
 
   private back(): void {
+    if (this.showCastConnection) { this.showCastConnection = false; return; }
+    if (this.showCastEpisodes) { this.showCastEpisodes = false; return; }
+    if (this.castDisconnecting) { this.toast('正在断开投屏，请稍候'); return; }
+    if (this.castSwitching) { this.toast('正在切换剧集，请稍候'); return; }
+    if (this.castSession !== null && this.castController !== null && this.castDevice !== null) {
+      const ep = this.playableEpisode();
+      CastHandoff.park({
+        session: this.castSession, controller: this.castController, device: this.castDevice,
+        deviceName: this.castDeviceName, playing: this.playing, volume: this.castVolume,
+        mediaUri: this.castMediaUri, assetId: this.castAssetId,
+        landscape: this.castPreviousLandscape, rotationMode: this.rotationMode, episodes: this.episodes,
+        record: { sourceKey: this.sourceKey, vodId: this.vodId, name: this.title,
+          pic: this.resolvePic(), sourceName: this.infoSourceName(), episode: this.currentEp,
+          episodeName: ep !== null ? ep.name : this.episodeName,
+          playUrl: ep !== null ? ep.url : this.episodeUrl, lineIndex: this.lineIndex,
+          positionMs: this.positionMs, durationMs: this.durationMs, updatedAt: Date.now() }
+      });
+      this.castSession = null;
+      this.castController = null;
+      this.restoreWindowState();
+      this.restoreBrightness();
+      this.release();
+      this.navPathStack.clear();
+      return;
+    }
     this.saveProgress();
     // 先停播、交还窗口状态，再 pop。
     // 只靠 aboutToDisappear 不够稳：页面销毁由框架调度，万一它没跑到，
@@ -1965,6 +2682,434 @@ export struct PlayerPage {
     this.clearAdjustTimer();
     this.release();
     this.navPathStack.pop();
+  }
+
+  private applyCastRotation(mode: string = this.rotationMode): void {
+    this.rotationMode = mode;
+    this.syncTopPad();
+    this.applyScreenRotation(mode, true);
+  }
+
+  private applyLocalRotation(mode: string = this.rotationMode): void {
+    this.rotationMode = mode;
+    this.syncTopPad();
+    this.applyScreenRotation(mode, false);
+  }
+
+  private applyScreenRotation(mode: string, casting: boolean): void {
+    const context = this.getUIContext().getHostContext();
+    if (context === undefined) { return; }
+    DevicePolicy.suppressed = true;
+    window.getLastWindow(context).then((win: window.Window) => {
+      if (this.released || (casting ? this.castDeviceName === '' || this.rotationMode !== mode
+        : this.castDeviceName !== '' || this.rotationMode !== mode)) { return; }
+      const orientation = mode === 'auto' ? window.Orientation.AUTO_ROTATION
+        : mode === 'landscape' ? window.Orientation.LANDSCAPE
+        : mode === 'portrait' ? window.Orientation.PORTRAIT
+        : window.Orientation.AUTO_ROTATION_RESTRICTED;
+      win.setPreferredOrientation(orientation).then(() => {
+        if (!this.released) { this.syncTopPad(); }
+      }).catch(() => { this.toast('屏幕方向设置失败，请重试'); });
+    }).catch(() => {});
+  }
+
+  private confirmRecast(): void {
+    const session = this.castSession;
+    const device = this.castDevice;
+    if (session === null || device === null) { this.toast('请先选择电视'); return; }
+    this.getUIContext().getPromptAction().showDialog({
+      title: '重新投播', message: '这会替换所选电视当前的内容，从手机保存的进度重新播放。',
+      buttons: [{ text: '取消', color: '#808080' }, { text: '重新投播', color: '#E34D59' }]
+    }).then((result) => {
+      if (result.index !== 1 || this.released || this.castSession !== session) { return; }
+      this.castGeneration++;
+      CastResume.clear();
+      this.restoreCast = false;
+      this.castRestoreStatus = '';
+      this.connectRemote(session, device);
+    }).catch(() => {});
+  }
+
+  @Builder
+  private CastRestorePanel() {
+    Column({ space: 18 }) {
+      Text('恢复电视遥控').fontSize(22).fontWeight(FontWeight.Bold).fontColor($r('app.color.color_text'))
+      Text(this.title).fontSize(16).fontColor($r('app.color.color_text')).maxLines(2)
+      Text('上次设备：' + (CastResume.load()?.deviceName ?? '电视')).fontSize(14).fontColor($r('app.color.color_text_secondary'))
+      Text(this.castRestoreStatus || '请在下方投屏列表选择原来的电视。连接后先读取电视进度，不会重新发送视频。')
+        .fontSize(14).fontColor($r('app.color.color_text_secondary')).textAlign(TextAlign.Center)
+      if (this.castSessionReady) {
+        AVCastPicker({ normalColor: '#E34D59', activeColor: '#E34D59', pickerStyle: AVCastPickerStyle.STYLE_MENU,
+          colorMode: AVCastPickerColorMode.AUTO, sessionType: 'video',
+          onStateChange: (state: AVCastPickerState) => { console.info('[cast] restore picker state=' + state); }
+        }).width(48).height(48)
+      } else {
+        Button('重试连接').onClick(() => { this.initCastSession(); })
+          .backgroundColor($r('app.color.color_chip_bg')).fontColor($r('app.color.color_text'))
+      }
+      Button('重新投播').onClick(() => { this.confirmRecast(); })
+        .backgroundColor($r('app.color.color_chip_bg')).fontColor($r('app.color.color_text'))
+      Button('在手机播放').onClick(() => { this.playOnPhone(); })
+        .backgroundColor($r('app.color.color_primary')).fontColor(Color.White)
+      Button('返回首页').onClick(() => { this.back(); })
+        .backgroundColor($r('app.color.color_chip_bg')).fontColor($r('app.color.color_text'))
+    }.width('100%').height('100%').justifyContent(FlexAlign.Center).padding(28)
+      .backgroundColor($r('app.color.color_bg'))
+  }
+
+  @Builder
+  private CastConnectionPanel() {
+    Stack({ alignContent: Alignment.Bottom }) {
+      Column().width('100%').height('100%').backgroundColor('#66000000')
+        .onClick(() => { this.showCastConnection = false; })
+      Column({ space: 16 }) {
+        Row() {
+          Text('投屏连接').fontSize(18).fontWeight(FontWeight.Medium).fontColor($r('app.color.color_text')).layoutWeight(1)
+          Button('关闭').height(32).fontSize(12).onClick(() => { this.showCastConnection = false; })
+            .backgroundColor($r('app.color.color_chip_bg')).fontColor($r('app.color.color_text'))
+        }.width('100%')
+        Row({ space: 12 }) {
+          Image($r('app.media.ic_player_cast')).width(26).height(26).fillColor($r('app.color.color_primary'))
+          Column({ space: 4 }) {
+            Text(this.castDeviceName).fontSize(16).fontColor($r('app.color.color_text')).maxLines(1)
+            Text('已连接').fontSize(12).fontColor($r('app.color.color_text_secondary'))
+          }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+        }.width('100%')
+        Button(this.castDisconnecting ? '正在断开…' : '断开投屏').width('100%').height(42)
+          .backgroundColor($r('app.color.color_chip_bg')).fontColor($r('app.color.color_text'))
+          .enabled(!this.castDisconnecting).onClick(() => { this.disconnectCast(); })
+      }.width('100%').padding({ left: 20, right: 20, top: 18, bottom: SystemInsets.bottom() + 20 })
+        .backgroundColor($r('app.color.color_card')).borderRadius({ topLeft: 20, topRight: 20 })
+    }.width('100%').height('100%')
+  }
+
+  @Builder
+  private CastReturnPanel() {
+    Column({ space: 12 }) {
+      Button('返回').height(36).alignSelf(ItemAlign.Start).onClick(() => { this.back(); })
+        .backgroundColor($r('app.color.color_chip_bg')).fontColor($r('app.color.color_text'))
+      Column({ space: 14 }) {
+        if (this.resolvePic() !== '') {
+          Image(this.resolvePic()).width(this.canvasW > this.canvasH ? 48 : 80)
+            .height(this.canvasW > this.canvasH ? 64 : 108).objectFit(ImageFit.Cover).borderRadius(10)
+        }
+        Text('投屏已结束').fontSize(20).fontWeight(FontWeight.Medium).fontColor($r('app.color.color_text'))
+        Text(this.title).fontSize(15).fontColor($r('app.color.color_text')).maxLines(1)
+        Text('已保留进度 ' + this.positionText).fontSize(13).fontColor($r('app.color.color_text_secondary'))
+        Button('在手机继续播放').height(42).onClick(() => { this.togglePlay(); })
+          .backgroundColor($r('app.color.color_chip_bg')).fontColor($r('app.color.color_text'))
+      }.width('100%').layoutWeight(1).justifyContent(FlexAlign.Center)
+    }.width('100%').height('100%')
+      .padding({ left: 24, right: 24, top: SystemInsets.top() + 12, bottom: SystemInsets.bottom() + 12 })
+      .backgroundColor($r('app.color.color_bg'))
+  }
+
+  @Builder
+  private CastEpisodePanel() {
+    Stack({ alignContent: Alignment.Bottom }) {
+      Column().width('100%').height('100%').backgroundColor('#66000000')
+        .onClick(() => { this.showCastEpisodes = false; })
+      Column({ space: 12 }) {
+        Row() {
+          Text('投屏选集').fontSize(16).fontWeight(FontWeight.Bold).fontColor($r('app.color.color_text')).layoutWeight(1)
+          Button('关闭').height(30).fontSize(12).onClick(() => { this.showCastEpisodes = false; })
+            .backgroundColor($r('app.color.color_chip_bg')).fontColor($r('app.color.color_text'))
+        }.width('100%')
+        Grid() {
+          ForEach(this.episodes, (ep: Episode, index: number) => {
+            GridItem() {
+              Text(ep.name).fontSize(13).maxLines(1).textAlign(TextAlign.Center)
+                .fontColor(this.epTextColor(ep)).backgroundColor(this.epBgColor(ep))
+                .width('100%').height(40).borderRadius(8)
+                .onClick(() => { if (index === this.currentEp) { this.showCastEpisodes = false; } else { this.selectRemoteEpisode(index); } })
+            }
+          }, (ep: Episode) => ep.index + ':' + ep.url)
+        }.columnsTemplate(this.canvasW > this.canvasH ? '1fr 1fr 1fr 1fr 1fr 1fr' : '1fr 1fr 1fr')
+          .rowsGap(8).columnsGap(8).layoutWeight(1).scrollBar(BarState.Auto)
+      }.width('100%').height(this.canvasW > this.canvasH ? '80%' : '55%').padding(18)
+        .padding({ bottom: SystemInsets.bottom() + 18 })
+        .backgroundColor($r('app.color.color_card')).borderRadius({ topLeft: 20, topRight: 20 })
+    }.width('100%').height('100%')
+  }
+
+  @Builder
+  private CastMediaInfo() {
+    Column({ space: this.canvasW > this.canvasH ? 6 : 12 }) {
+        if (this.resolvePic() !== '') {
+          Image(this.resolvePic()).width(this.canvasW > this.canvasH ? 44 : 100).height(this.canvasW > this.canvasH ? 56 : 128).objectFit(ImageFit.Cover).borderRadius(10)
+        }
+        Text(this.title).fontSize(this.canvasW > this.canvasH ? 16 : 20).fontWeight(FontWeight.Bold).fontColor($r('app.color.color_text'))
+          .maxLines(this.canvasW > this.canvasH ? 1 : 2).textAlign(TextAlign.Center)
+        Text(this.playing ? '远端正在播放' : '远端已暂停').fontSize(12).fontColor($r('app.color.color_text_secondary'))
+        if (this.episodes.length > 1) {
+          Text(this.castSwitching && this.castSwitchTarget >= 0 ? '正在切换到 ' + (this.episodes[this.castSwitchTarget]?.name ?? '') + '…' :
+            (this.episodes[this.currentEp]?.name ?? this.episodeName) + ' · 共 ' + this.episodes.length + ' 集')
+            .fontSize(13).fontColor($r('app.color.color_text_secondary')).maxLines(1)
+          Row({ space: 8 }) {
+            Button('上一集').height(32).fontSize(12)
+              .backgroundColor($r('app.color.color_chip_bg')).fontColor($r('app.color.color_text'))
+              .enabled(!this.castSwitching && this.currentEp > 0)
+              .onClick(() => { this.selectEpisode(this.currentEp - 1); })
+            Button('选集').height(32).fontSize(12)
+              .backgroundColor($r('app.color.color_chip_bg')).fontColor($r('app.color.color_text'))
+              .enabled(!this.castSwitching).onClick(() => { this.showCastConnection = false; this.showCastEpisodes = true; })
+            Button('下一集').height(32).fontSize(12)
+              .backgroundColor($r('app.color.color_chip_bg')).fontColor($r('app.color.color_text'))
+              .enabled(!this.castSwitching && this.currentEp + 1 < this.episodes.length)
+              .onClick(() => { this.selectEpisode(this.currentEp + 1); })
+          }
+        }
+    }.width('100%').padding(this.canvasW > this.canvasH ? 12 : 18)
+      .backgroundColor($r('app.color.color_card')).borderRadius(20)
+
+  }
+
+  @Builder
+  private CastControls() {
+    Column({ space: 8 }) {
+        Slider({ value: this.sliderValue, min: 0, max: this.sliderMax, step: 1 })
+          .width('100%').height(28).enabled(this.durationMs > 0)
+          .selectedColor($r('app.color.color_primary')).blockColor($r('app.color.color_primary'))
+          .onChange((value: number, mode: SliderChangeMode) => { this.onSliderChange(value, mode); })
+        Text(this.positionText + ' / ' + (this.durationMs > 0 ? this.durationText : '--:--'))
+          .fontSize(13).fontColor($r('app.color.color_text_secondary'))
+        Row({ space: 16 }) {
+          Button('快退 10 秒').height(34).fontSize(13)
+            .backgroundColor($r('app.color.color_chip_bg')).fontColor($r('app.color.color_text')).enabled(this.durationMs > 0)
+            .onClick(() => { this.onSliderChange(Math.max(0, this.positionMs - 10000) / 1000, SliderChangeMode.End); })
+          Button({ type: ButtonType.Circle }) {
+            Image(this.playing ? $r('app.media.ic_player_pause') : $r('app.media.ic_player_play'))
+              .width(26).height(26).fillColor($r('app.color.color_text'))
+          }.width(56).height(56).padding(0)
+            .backgroundColor($r('app.color.color_chip_bg'))
+            .accessibilityText(this.playing ? '暂停电视播放' : '继续电视播放')
+            .onClick(() => { this.togglePlay(); })
+          Button('快进 10 秒').height(34).fontSize(13)
+            .backgroundColor($r('app.color.color_chip_bg')).fontColor($r('app.color.color_text')).enabled(this.durationMs > 0)
+            .onClick(() => { this.onSliderChange(Math.min(this.durationMs, this.positionMs + 10000) / 1000, SliderChangeMode.End); })
+        }
+        Row({ space: 12 }) {
+          Text('远端音量').fontSize(13).fontColor($r('app.color.color_text_secondary'))
+          Slider({ value: this.castVolume, min: 0, max: 100, step: 1 })
+            .layoutWeight(1).height(28)
+            .onChange((value: number, mode: SliderChangeMode) => {
+              if (mode === SliderChangeMode.End) { this.castCommand('setVolume', value); }
+            })
+        }.width('100%')
+    }.width('100%').padding(this.canvasW > this.canvasH ? 12 : 18)
+      .backgroundColor($r('app.color.color_card')).borderRadius(20)
+
+  }
+
+  @Builder
+  private CastDirectionMenu() {
+    Menu() {
+      ForEach(['system', 'auto', 'landscape', 'portrait'], (mode: string) => {
+        MenuItem({ content: mode === 'system' ? '跟随系统' : mode === 'auto' ? '自动旋转' : mode === 'landscape' ? '横屏' : '竖屏',
+          labelInfo: this.rotationMode === mode ? '✓' : '' })
+          .onClick(() => {
+            if (this.castDeviceName !== '') { this.applyCastRotation(mode); }
+            else { this.applyLocalRotation(mode); }
+            SettingsStore.shared().update({ playerRotation: mode });
+          })
+      }, (mode: string) => mode)
+    }.onAppear(() => {
+      this.showSpeeds = false;
+      this.showEpisodes = false;
+      this.showSources = false;
+      this.showCastEpisodes = false;
+      this.showCastConnection = false;
+    })
+  }
+
+  private bindSleepTimer(): void {
+    SleepTimer.action = async () => {
+      // A newer player page can rebind the timer while the TV session is parked.
+      // Always stop the parked remote session before consulting this page's state.
+      if (CastHandoff.peek() !== null) { await CastHandoff.stop(); return; }
+      if (this.released) { return; }
+      this.endPress(true);
+      if (this.castController !== null) {
+        const controller = this.castController;
+        try {
+          await controller.sendControlCommand({ command: 'stop' });
+          if (!controller.direct && this.castSession !== null) { await this.castSession.stopCasting(); }
+          if (this.castController === controller) { this.finishCastDisconnect(); }
+          CastResume.clear();
+        } catch (e) {
+          this.toast('定时停止失败，电视可能仍在播放，请重试');
+          throw new Error('电视停止失败');
+        } finally {
+          await CastBackgroundTask.stop();
+        }
+      } else {
+        this.player.pause();
+        this.saveProgress();
+        this.toast('已按定时设置暂停');
+      }
+    };
+  }
+
+  private captureSleepTimerAnchor(area: Area): void {
+    const x = area.globalPosition.x;
+    const y = area.globalPosition.y;
+    if (x === undefined || y === undefined) { return; }
+    const left = Number.parseFloat(x.toString());
+    const top = Number.parseFloat(y.toString());
+    const width = Number.parseFloat(area.width.toString());
+    const height = Number.parseFloat(area.height.toString());
+    if (Number.isFinite(left) && Number.isFinite(width)) {
+      this.sleepTimerAnchorLeft = left;
+      this.sleepTimerAnchorRight = left + width;
+    }
+    if (Number.isFinite(top) && Number.isFinite(height)) {
+      this.sleepTimerAnchorTop = top;
+      this.sleepTimerAnchorBottom = top + height;
+    }
+  }
+
+  private showSleepTimer(): void {
+    if (this.sleepTimerDialogOpen) { return; }
+    this.sleepTimerDialogOpen = true;
+    this.openSleepTimerDialog();
+  }
+
+  private openSleepTimerDialog(): void {
+    const choices: SleepTimerChoice[] = [
+      { label: '15 分钟后停止', minutes: 15 },
+      { label: '30 分钟后停止', minutes: 30 },
+      { label: '60 分钟后停止', minutes: 60 },
+      { label: '本集结束后停止', minutes: -1 },
+      { label: '关闭定时', minutes: 0 }
+    ];
+    this.sleepTimerDialogController = new CustomDialogController({
+      maskColor: '#66000000',
+      customStyle: true,
+      cancel: () => {
+        if (!this.sleepTimerDialogRelayoutPending) { this.sleepTimerDialogOpen = false; }
+      },
+      alignment: this.sleepTimerDialogAlignment(),
+      offset: this.sleepTimerDialogOffset(),
+      builder: SleepTimerDialog({
+        currentLabel: SleepTimer.label(),
+        selectedMinutes: SleepTimer.selectedMinutes(),
+        listMaxHeight: Math.max(60, Math.min(this.canvasW > this.canvasH ? 180 : 300, this.canvasH - SystemInsets.top() - SystemInsets.bottom() - 100)),
+        isLandscape: this.canvasW > this.canvasH,
+        choices: choices,
+        onClose: () => { this.sleepTimerDialogOpen = false; },
+        onSelect: (minutes: number) => {
+          this.sleepTimerDialogOpen = false;
+          if (this.released) { return; }
+          this.selectSleepTimer(minutes).catch(() => {});
+        }
+      })
+    });
+    this.sleepTimerDialogController.open();
+  }
+
+  private sleepTimerDialogAlignment(): DialogAlignment {
+    if (this.canvasW <= this.canvasH) { return DialogAlignment.Bottom; }
+    const rightSide = this.sleepTimerAnchorLeft + this.sleepTimerAnchorRight > this.canvasW;
+    const openUp = this.sleepTimerAnchorTop > this.canvasH / 2;
+    if (openUp) { return rightSide ? DialogAlignment.BottomEnd : DialogAlignment.BottomStart; }
+    return rightSide ? DialogAlignment.TopEnd : DialogAlignment.TopStart;
+  }
+
+  private sleepTimerDialogOffset(): Offset {
+    if (this.canvasW <= this.canvasH) { return { dx: 0, dy: -SystemInsets.bottom() - 8 }; }
+    const rightSide = this.sleepTimerAnchorLeft + this.sleepTimerAnchorRight > this.canvasW;
+    const openUp = this.sleepTimerAnchorTop > this.canvasH / 2;
+    const dx = rightSide ? this.sleepTimerAnchorRight - this.canvasW : this.sleepTimerAnchorLeft;
+    const dy = openUp ? this.sleepTimerAnchorTop - this.canvasH - 8 : this.sleepTimerAnchorBottom + 8;
+    return { dx: dx, dy: dy };
+  }
+
+  private relayoutSleepTimerDialog(): void {
+    if (!this.sleepTimerDialogOpen || this.sleepTimerDialogController === undefined) { return; }
+    this.sleepTimerDialogRelayoutPending = true;
+    this.sleepTimerDialogController.close();
+    if (this.sleepTimerDialogRelayoutTimer !== -1) { clearTimeout(this.sleepTimerDialogRelayoutTimer); }
+    this.sleepTimerDialogRelayoutTimer = setTimeout(() => {
+      this.sleepTimerDialogRelayoutTimer = -1;
+      this.sleepTimerDialogRelayoutPending = false;
+      if (this.sleepTimerDialogOpen && !this.released) { this.openSleepTimerDialog(); }
+    }, 250);
+  }
+
+  private async selectSleepTimer(minutes: number): Promise<void> {
+    const casting = this.castController !== null || CastHandoff.peek() !== null;
+    const context = this.getUIContext().getHostContext() as common.UIAbilityContext | undefined;
+    if (minutes > 0 || minutes === -1) {
+      if (casting) {
+        if (context === undefined) { this.toast('无法启动投屏后台计时'); return; }
+        try {
+          await CastBackgroundTask.start(context);
+        } catch (e) {
+          this.toast('后台计时启动失败，请保持应用在前台');
+          return;
+        }
+      } else {
+        await CastBackgroundTask.stop().catch(() => {});
+      }
+    } else {
+      await CastBackgroundTask.stop().catch(() => {});
+    }
+    SleepTimer.set(minutes);
+    this.scheduleHideControls();
+  }
+
+  private castStatusLabel(): string {
+    if (this.castDisconnecting) { return '正在停止电视播放…'; }
+    if (this.castPhase !== '') { return this.castPhase; }
+    if (this.castPhaseError !== '') { return this.castPhaseError; }
+    return '';
+  }
+
+  @Builder
+  private CastRemotePanel() {
+    Column({ space: 12 }) {
+      Row({ space: 8 }) {
+        Button('返回').height(40).fontSize(13).onClick(() => { this.back(); })
+          .backgroundColor($r('app.color.color_chip_bg')).fontColor($r('app.color.color_text'))
+        Column({ space: 2 }) {
+          Text('投屏遥控器').fontSize(16).fontWeight(FontWeight.Medium).fontColor($r('app.color.color_text'))
+          Text(this.castDeviceName).fontSize(12).fontColor($r('app.color.color_text_secondary'))
+            .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+          if (this.castStatusLabel() !== '') {
+            Text(this.castStatusLabel()).fontSize(11).fontColor($r('app.color.color_text_secondary'))
+              .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+          }
+        }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+        Button({ type: ButtonType.Circle }) {
+          Image($r('app.media.ic_player_cast')).width(22).height(22).fillColor($r('app.color.color_primary'))
+        }.width(40).height(40).padding(0).backgroundColor($r('app.color.color_chip_bg'))
+          .accessibilityText('已连接到' + this.castDeviceName + '，打开投屏连接面板')
+          .onClick(() => { this.showCastEpisodes = false; this.showCastConnection = true; })
+        Button({ type: ButtonType.Circle }) {
+          Image($r('app.media.ic_player_timer')).width(22).height(22)
+            .fillColor(this.sleepTimerLabel === '未开启' ? $r('app.color.color_text') : $r('app.color.color_primary'))
+        }.width(40).height(40).padding(0)
+          .backgroundColor($r('app.color.color_chip_bg'))
+          .accessibilityText('定时停止播放').onClick(() => { this.showSleepTimer(); })
+          .onAreaChange((_old: Area, area: Area) => { this.captureSleepTimerAnchor(area); })
+        Button({ type: ButtonType.Circle }) {
+          Image(this.rotationIcon()).width(22).height(22).fillColor(this.rotationMode === 'auto' ? $r('app.color.color_primary') : $r('app.color.color_text'))
+        }.width(40).height(40).padding(0).backgroundColor($r('app.color.color_chip_bg'))
+          .accessibilityText('屏幕方向').bindMenu(this.CastDirectionMenu)
+      }.width('100%')
+      if (this.canvasW > this.canvasH) {
+        Row({ space: 24 }) {
+          Column() { this.CastMediaInfo() }.layoutWeight(2)
+          Column() { this.CastControls() }.layoutWeight(3)
+        }.width('100%').layoutWeight(1).alignItems(VerticalAlign.Center)
+      } else {
+        Column({ space: 24 }) {
+          this.CastMediaInfo()
+          this.CastControls()
+        }.width('100%').layoutWeight(1).justifyContent(FlexAlign.Center)
+      }
+    }.width('100%').height('100%').padding({ left: this.canvasW > this.canvasH ? SystemInsets.top() + 12 : 20, right: this.canvasW > this.canvasH ? SystemInsets.top() + 12 : 20, top: this.canvasW > this.canvasH ? 10 : SystemInsets.top() + 12, bottom: SystemInsets.bottom() + 8 })
+      .backgroundColor($r('app.color.color_bg'))
   }
 
   build() {
@@ -1987,33 +3132,36 @@ export struct PlayerPage {
             this.onSurfaceDestroy();
           }
         })
+          .opacity(this.castDeviceName === '' ? 1 : 0)
+
+        if (this.restoreCast && this.castDeviceName === '') {
+          this.CastRestorePanel()
+        } else if (this.castDeviceName !== '') {
+          this.CastRemotePanel()
+        } else if (this.localResumePending) {
+          this.CastReturnPanel()
+        }
 
         // 点击层：轻点画面显示/隐藏控制条（置于控制层之下，避免事件冒泡误触）。
         // 长按加速 / 长按左右滑快进快退也挂在这一层：它铺满全屏、又是直接命中目标，
         // 控制条隐藏时必定收得到 Touch；控制条可见时处理函数里直接让位，
         // 保证按钮和进度条不被抢。
         Column()
+          .hitTestBehavior(this.castDeviceName !== '' || this.restoreCast || this.localResumePending ? HitTestMode.None : HitTestMode.Default)
           .width('100%')
           .height('100%')
           .onTouch((event: TouchEvent) => {
             this.handlePressTouch(event);
           })
-          .onClick(() => {
-            // 长按后抬手不该顺带把控制条呼出来
-            if (this.suppressTap) {
-              this.suppressTap = false;
-              return;
-            }
-            if (!this.controlsVisible) {
-              this.controlsVisible = true;
-              this.scheduleHideControls();
-            } else {
-              this.controlsVisible = false;
-            }
-          })
+          .gesture(
+            GestureGroup(GestureMode.Exclusive,
+              TapGesture({ count: 2 }).onAction(() => { this.handleVideoDoubleTap(); }),
+              TapGesture({ count: 1 }).onAction(() => { this.handleVideoTap(); })
+            )
+          )
 
         // 加载 / 错误态
-        if ((this.showLoading || this.stallLoading) && this.errorText === '') {
+        if (!this.restoreCast && (this.showLoading || this.stallLoading) && this.errorText === '') {
           Column({ space: 10 }) {
             // 播放器背景是黑的，用白色圈；用主题红在暗背景上非常扎眼
             LoadingProgress()
@@ -2031,31 +3179,42 @@ export struct PlayerPage {
           .hitTestBehavior(HitTestMode.None)
         }
 
-        // 长按加速 / 长按左右滑的状态浮层
-        if (this.pressSpeed) {
+        // 快进预览只在横向手势期间短暂显示。
+        if (this.seekPreviewVisible) {
           Column({ space: 6 }) {
-            if (this.seekPreviewing) {
-              Text(this.seekDeltaText())
-                .fontSize(24)
-                .fontWeight(FontWeight.Bold)
-                .fontColor(Color.White)
-              Text(Utils.formatTime(this.seekPreviewMs) + ' / ' +
-                (this.durationMs > 0 ? this.durationText : '--:--'))
-                .fontSize(12)
-                .fontColor('#DDDDDD')
-            } else {
-              Text(this.pressSpeedLabel())
-                .fontSize(18)
-                .fontWeight(FontWeight.Bold)
-                .fontColor(Color.White)
-              Text('左右滑动可快进 / 快退')
-                .fontSize(11)
-                .fontColor('#BBBBBB')
-            }
+            Text(this.seekDeltaText())
+              .fontSize(24)
+              .fontWeight(FontWeight.Bold)
+              .fontColor(Color.White)
+            Text(Utils.formatTime(this.seekPreviewMs) + ' / ' +
+              (this.durationMs > 0 ? this.durationText : '--:--'))
+              .fontSize(12)
+              .fontColor('#DDDDDD')
           }
           .padding({ left: 20, right: 20, top: 14, bottom: 14 })
           .borderRadius(14)
           .backgroundColor('#B3000000')
+          .hitTestBehavior(HitTestMode.None)
+        }
+        // 快速播放时只显示简洁的倍速标记。
+        if (this.pauseHintVisible && this.castDeviceName === '' && !this.restoreCast && !this.localResumePending && !this.pipActive) {
+          Column() {
+            Text('已暂停').fontSize(14).fontColor(Color.White)
+              .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+              .backgroundColor('#66000000').borderRadius(16)
+          }.width('100%').height('100%').justifyContent(FlexAlign.Start)
+            .padding({ top: SystemInsets.top() + 56 }).hitTestBehavior(HitTestMode.None)
+        }
+        if (this.pressSpeed) {
+          Column() {
+            Text(this.settings.longPressSpeed.toString() + 'X')
+              .fontSize(15).fontWeight(FontWeight.Medium).fontColor(Color.White)
+              .padding({ left: 12, right: 12, top: 5, bottom: 5 })
+              .backgroundColor('#20000000').backgroundEffect({ radius: 6 })
+              .borderRadius(16)
+          }
+          .width('100%').height('100%').justifyContent(FlexAlign.Start)
+          .padding({ top: SystemInsets.top() + 56 })
           .hitTestBehavior(HitTestMode.None)
         }
         if (this.errorText !== '') {
@@ -2075,6 +3234,16 @@ export struct PlayerPage {
                 .onClick(() => {
                   this.back();
                 })
+              if (this.offlineDir === '' && this.title !== '') {
+                Button('换源')
+                  .fontSize(14)
+                  .fontColor(Color.White)
+                  .backgroundColor('#40FFFFFF')
+                  .onClick(() => {
+                    this.controlsVisible = true;
+                    this.runSpeedTest();
+                  })
+              }
               Button('重试')
                 .fontSize(14)
                 .backgroundColor($r('app.color.color_primary'))
@@ -2091,8 +3260,28 @@ export struct PlayerPage {
           .backgroundColor('#B3000000')
         }
 
+        // 仅横屏显示锁按钮；锁定后轻点画面可唤出解锁钮。
+        if (!this.localResumePending && !this.restoreCast && this.castDeviceName === '' && !this.pipActive && this.canvasW > this.canvasH && this.controlsVisible) {
+          Stack({ alignContent: Alignment.Center }) {
+          Image(this.screenLocked ? $r('app.media.ic_player_lock') : $r('app.media.ic_player_unlock'))
+            .width(21)
+            .height(21)
+            .fillColor(Color.White)
+        }
+            .width(42)
+            .height(42)
+            .backgroundColor('#80000000')
+            .borderRadius(21)
+            .position({ x: 36, y: Math.max(0, this.canvasH / 2 - 21) })
+            .onClick(() => {
+              this.screenLocked = !this.screenLocked;
+              this.controlsVisible = !this.screenLocked;
+              if (!this.screenLocked) { this.scheduleHideControls(); }
+            })
+        }
+
         // 控制层
-        if (this.controlsVisible && this.errorText === '') {
+        if (!this.localResumePending && !this.restoreCast && this.castDeviceName === '' && this.controlsVisible && this.errorText === '' && !this.screenLocked) {
           Column({ space: 0 }) {
             // 顶部栏
             Row({ space: 10 }) {
@@ -2160,22 +3349,38 @@ export struct PlayerPage {
               .onClick(() => {
                 this.shareMovie();
               })
+              if (this.pipAvailable && this.castDeviceName === '') {
+                Stack({ alignContent: Alignment.Center }) {
+                  Image($r('app.media.ic_player_pip'))
+                    .width(20).height(20).fillColor($r('app.color.color_text'))
+                }
+                .width(34).height(34).borderRadius(17)
+                .backgroundColor($r('app.color.color_player_scrim'))
+                .accessibilityText('进入画中画')
+                .enabled(!this.pipStarting)
+                .onClick(() => { this.enterPiP(); })
+              }
               Stack({ alignContent: Alignment.Center }) {
-                Image($r('app.media.ic_player_fullscreen'))
-                  .width(18)
-                  .height(18)
-                  .fillColor($r('app.color.color_text'))
-                  .opacity(this.landscape ? 1 : 0.85)
+                Image($r('app.media.ic_player_timer')).width(24).height(24)
+                  .fillColor(this.sleepTimerLabel === '未开启' ? Color.White : $r('app.color.color_primary'))
+              }
+              .width(34).height(34).borderRadius(17)
+              .backgroundColor($r('app.color.color_player_scrim'))
+              .accessibilityText('定时停止播放')
+              .onAreaChange((_old: Area, area: Area) => { this.captureSleepTimerAnchor(area); })
+              .onClick(() => { this.showSleepTimer(); })
+              Stack({ alignContent: Alignment.Center }) {
+                Image(this.rotationIcon())
+                  .width(22)
+                  .height(22)
+                  .fillColor(this.rotationMode === 'auto' ? $r('app.color.color_primary') : $r('app.color.color_text'))
               }
               .width(34)
               .height(34)
               .borderRadius(17)
               .backgroundColor($r('app.color.color_player_scrim'))
-              .onClick(() => {
-                // 横屏 -> 竖屏（退出全屏）；竖屏 -> 横屏（重新全屏）
-                // 画面会随容器尺寸重新等比计算并居中，不会拉伸
-                this.setLandscape(!this.landscape);
-              })
+              .accessibilityText('屏幕方向：' + this.rotationMode)
+              .bindMenu(this.CastDirectionMenu)
             }
             .width('100%')
             // 横屏：贴屏幕物理顶边（留白会让画面顶部多出一块，看着不像全屏）。
@@ -2243,6 +3448,9 @@ export struct PlayerPage {
                     .maxLines(1)
                     .onClick(() => {
                       this.showSpeeds = !this.showSpeeds;
+                      this.showEpisodes = false;
+                      this.showSources = false;
+                      this.scheduleHideControls();
                     })
                   if (this.episodes.length > 1) {
                     Text('选集')
@@ -2256,6 +3464,9 @@ export struct PlayerPage {
                       .maxLines(1)
                       .onClick(() => {
                         this.showEpisodes = !this.showEpisodes;
+                        this.showSpeeds = false;
+                        this.showSources = false;
+                        this.scheduleHideControls();
                       })
                   }
                   if (this.currentEp + 1 < this.episodes.length) {
@@ -2272,23 +3483,35 @@ export struct PlayerPage {
                         this.selectEpisode(this.currentEp + 1);
                       })
                   }
-                  // 投屏：系统提供的投屏图标，点按拉起系统投屏设备列表
-                  Row() {
-                    AVCastPicker({
-                      normalColor: '#FFFFFF',
-                      activeColor: Color.White,
-                      pickerStyle: AVCastPickerStyle.STYLE_MENU,
-                      colorMode: AVCastPickerColorMode.AUTO,
-                      sessionType: 'video'
-                    })
-                      .width(24)
-                      .height(24)
+                  if (this.castDeviceName !== '') {
+                    Text('正在投播 · ' + this.castDeviceName + ' · 断开')
+                      .fontSize(12).fontColor('#FFFFFF').maxLines(1)
+                      .onClick(() => { this.disconnectCast(); })
                   }
-                  .height(28)
-                  .padding({ left: 5, right: 5 })
-                  .backgroundColor('#26FFFFFF')
-                  .borderRadius(14)
-                  .justifyContent(FlexAlign.Center)
+                  // 系统发现同一局域网的 Cast+ / DLNA 电视，连接后交付视频 URL。
+                  if (this.offlineDir === '') {
+                    Row() {
+                      AVCastPicker({
+                        normalColor: '#FFFFFF',
+                        activeColor: Color.White,
+                        pickerStyle: AVCastPickerStyle.STYLE_MENU,
+                        colorMode: AVCastPickerColorMode.AUTO,
+                        sessionType: 'video',
+                        onStateChange: (state: AVCastPickerState) => {
+                          if (state === AVCastPickerState.STATE_APPEARING) { this.releasePiP(); }
+                          else { this.initPiP(); }
+                        }
+                      })
+                        .width(24)
+                        .height(24)
+                    }
+                    .height(28)
+                    .padding({ left: 5, right: 5 })
+                    .backgroundColor('#26FFFFFF')
+                    .borderRadius(14)
+                    .justifyContent(FlexAlign.Center)
+
+                  }
 
                   // 横屏/大屏下补一个「铺满屏/适应屏」切换：车机等大屏可去掉黑边最大化画面
                   if (this.canvasW > this.canvasH && this.offlineDir === '') {
@@ -2326,9 +3549,7 @@ export struct PlayerPage {
               .width('100%')
             }
             .width('100%')
-            // bottom 只留 10：这块玻璃要一直铺到屏幕底边。
-            // 早先 18 + 外层 22 = 40vp 的透明留白，底下露出页面黑底，
-            // 看着就是"控制条浮在半空、下面还有一条安全区"。
+            // 控制栏背景铺到底，系统横条由播放页统一隐藏。
             .padding({ left: 16, right: 16, top: 6, bottom: 8 })
             // 方案 D：播放页控制条用液态玻璃（薄材质 + 自动互补色 + 按压形变 + 光随指动）
             // 底色不能用 color_panel_glass：那是跟随主题的"浅玻璃"，深色主题下是 20% 白，
@@ -2362,6 +3583,7 @@ export struct PlayerPage {
           }
           .width('100%')
           .height('100%')
+          .hitTestBehavior(HitTestMode.Transparent)
           // 全屏播放：控制层铺满整屏，上下都不再留安全区留白。
           // 早先 top 26 / bottom 22 是为了避开状态栏和手势条，代价是顶部影片信息
           // 栏和底部控制条都"浮在离边一段距离的地方"，看着不像是全屏。
@@ -2371,7 +3593,7 @@ export struct PlayerPage {
         // 中部播放按钮：只在「已经起播过」时出现（加载阶段不该有三角，
         // 否则看着像没自动播放）。放在 Stack 上由 alignContent 居中，
         // 正好落在画面正中 —— 与底部控制条的位置解耦。
-        if (this.controlsVisible && this.errorText === '' && this.hasStarted) {
+        if (!this.localResumePending && !this.restoreCast && this.castDeviceName === '' && !this.pipActive && !this.screenLocked && this.controlsVisible && this.errorText === '' && this.hasStarted) {
           Stack({ alignContent: Alignment.Center }) {
             Image(this.playing ? $r('app.media.ic_player_pause') : $r('app.media.ic_player_play'))
               .width(30)
@@ -2420,20 +3642,22 @@ export struct PlayerPage {
           .hitTestBehavior(HitTestMode.None)
         }
 
-        // 音量调节浮层：用系统 AVVolumePanel 才有权限改设备音量，
-        // 只显示不拦截触摸（滑动手指还在屏幕上）
-        if (this.adjustKind === 'volume') {
-          Stack({ alignContent: Alignment.End }) {
-            AVVolumePanel({ volumeLevel: this.volumeLevel })
-          }
-          .width('100%')
-          .height('100%')
-          .padding({ right: 12 })
-          .hitTestBehavior(HitTestMode.None)
+        // 提前挂载并保持组件实例：首次滑动才创建会漏掉初始化期间的音量更新。
+        // 系统音量提示由组件处理，不用 adjustKind 来创建/销毁它。
+        Stack({ alignContent: Alignment.End }) {
+          AVVolumePanel({ volumeLevel: this.volumeLevel })
+            .width(1)
+            .height(1)
+            .hitTestBehavior(HitTestMode.None)
         }
+        // AVVolumePanel 内部是跨进程 UIExtension；父级禁用命中不足以阻止它覆盖触摸。
+        .width(1)
+        .height(1)
+        .position({ x: 0, y: 0 })
+        .hitTestBehavior(HitTestMode.None)
 
         // 选集面板：贴底弹出，避免挡住画面中心
-        if (this.showEpisodes) {
+        if (this.showEpisodes && this.controlsVisible) {
           Column() {
             Column({ space: 8 }) {
             Row() {
@@ -2446,7 +3670,7 @@ export struct PlayerPage {
                 .fontSize(13)
                 .fontColor($r('app.color.color_primary'))
                 .onClick(() => {
-                  this.showEpisodes = false;
+                  this.closePlayerPanels();
                 })
             }
             .width('100%')
@@ -2483,41 +3707,32 @@ export struct PlayerPage {
           .justifyContent(FlexAlign.End)
           // 自身不参与命中测试，视频的「点击唤出控制条」不会被挡住
           .hitTestBehavior(HitTestMode.None)
-          .padding({ bottom: 18 })
         }
 
-        // 倍速面板：贴底弹出
-        if (this.showSpeeds) {
+        // 横向倍速按钮，保持原有样式并统一位于底部操作栏上方。
+        if (this.showSpeeds && this.controlsVisible) {
           Column() {
-            Row({ space: 10 }) {
-            ForEach(AvPlayerController.SPEEDS, (opt: PlaybackSpeedOption) => {
-              Text(opt.label)
-                .fontSize(13)
-                .fontColor(this.speedTextColor(opt))
-                .backgroundColor(this.speedBgColor(opt))
-                .borderRadius(16)
-                .padding({ left: 14, right: 14, top: 6, bottom: 6 })
-                .onClick(() => {
-                  this.selectSpeed(opt.value);
-                })
-            }, (opt: PlaybackSpeedOption) => opt.label)
-          }
-              .padding(10)
-              .backgroundColor($r('app.color.color_card'))
-              .borderRadius(20)
-            }
-            .width('100%')
-            .height('100%')
-            .justifyContent(FlexAlign.End)
-            .hitTestBehavior(HitTestMode.None)
-            .padding({ bottom: 18 })
+            Row({ space: 6 }) {
+              ForEach(AvPlayerController.SPEEDS, (opt: PlaybackSpeedOption) => {
+                Text(opt.label).fontSize(13).minFontSize(10).maxFontSize(13)
+                  .heightAdaptivePolicy(TextHeightAdaptivePolicy.MIN_FONT_SIZE_FIRST)
+                  .maxLines(1).textAlign(TextAlign.Center)
+                  .fontColor(this.speedTextColor(opt)).backgroundColor(this.speedBgColor(opt))
+                  .borderRadius(16).height(34).layoutWeight(1)
+                  .onClick(() => { this.selectSpeed(opt.value); })
+              }, (opt: PlaybackSpeedOption) => opt.label)
+            }.width('100%').constraintSize({ maxWidth: 520 }).padding(10)
+              .backgroundColor($r('app.color.color_card')).borderRadius(20)
+          }.width('100%').height('100%').justifyContent(FlexAlign.End)
+            .hitTestBehavior(HitTestMode.None).alignItems(HorizontalAlign.End)
+            .padding({ left: 16, right: 16, bottom: this.playerBarLift() + 76 })
         }
 
         // 换源面板：右下角小浮层。
         // 横屏时面板若铺满整宽、水平居中，会把整部片子挡住；
         // 这里固定 264vp 宽、列表最多约 3 行滚动，贴在右下角，
         // 既能完成换源，又几乎不影响看画面。
-        if (this.showSources) {
+        if (this.showSources && this.controlsVisible) {
           Column() {
             Column({ space: 6 }) {
               Row({ space: 8 }) {
@@ -2530,7 +3745,7 @@ export struct PlayerPage {
                   .fontSize(11)
                   .fontColor($r('app.color.color_primary'))
                   .onClick(() => {
-                    this.showSources = false;
+                    this.closePlayerPanels();
                   })
               }
               .width('100%')
@@ -2603,7 +3818,13 @@ export struct PlayerPage {
           .alignItems(HorizontalAlign.End)
           // 自身不参与命中测试，别挡住视频的「点击唤出控制条」
           .hitTestBehavior(HitTestMode.None)
-          .padding({ right: 16, bottom: 16 })
+          .padding({ left: 16, right: 16, bottom: this.playerBarLift() + 76 })
+        }
+        if (this.showCastEpisodes && this.castDeviceName !== '') {
+          this.CastEpisodePanel()
+        }
+        if (this.showCastConnection && this.castDeviceName !== '') {
+          this.CastConnectionPanel()
         }
       }
       .width('100%')
@@ -2615,8 +3836,19 @@ export struct PlayerPage {
         const w: number = this.areaNumber(newValue.width);
         const h: number = this.areaNumber(newValue.height);
         if (w > 0 && h > 0 && (w !== this.canvasW || h !== this.canvasH)) {
+          const wasLandscape = this.canvasW > this.canvasH;
+          const willBeLandscape = w > h;
+          this.endPress(true);
           this.canvasW = w;
           this.canvasH = h;
+          this.landscape = w > h;
+          if (wasLandscape !== willBeLandscape) { this.relayoutSleepTimerDialog(); }
+          this.syncTopPad();
+          if (w <= h && this.screenLocked) {
+            this.screenLocked = false;
+            this.controlsVisible = true;
+            this.scheduleHideControls();
+          }
           // 切回竖屏必须退出「铺满」：16:9 的流铺进竖屏会被裁到只剩中间一条，
           // 而竖屏下「铺满屏」按钮是隐藏的，用户没有退路。
           if (this.fitCover && w <= h) {
@@ -2625,25 +3857,22 @@ export struct PlayerPage {
           this.updateSurfaceSize();
         }
       })
-      // 上下滑调音量 / 亮度：左半屏音量、右半屏亮度，往上滑变大。
-      // 挂在根容器上而不是点击层：控制条显示时它铺满全屏，
-      // 挂在点击层会被它挡住（Slider / 按钮自己有手势，仍然优先响应）。
       .gesture(
         PanGesture({ fingers: 1, direction: PanDirection.Vertical })
           .onActionStart((event: GestureEvent) => {
-            const fingers = event.fingerList;
-            if (fingers.length > 0) {
-              // globalX 是相对窗口的，最贴近「屏幕左右半边」的直觉；
-              // 取不到（贴左边 = 0）时退回 localX。
-              const x: number = fingers[0].globalX > 0 ? fingers[0].globalX : fingers[0].localX;
-              this.beginAdjust(x);
+            if (this.localResumePending || this.screenLocked || this.castController !== null || this.pressSpeed || this.touchAxis === 'horizontal') { return; }
+            if (Math.abs(event.offsetY) <= Math.abs(event.offsetX)) { return; }
+            this.touchAxis = 'vertical';
+            if (event.fingerList.length > 0) {
+              this.beginAdjust(event.fingerList[0].localX);
+              if (this.adjustKind !== '') { this.clearPressTimer(); }
             }
           })
           .onActionUpdate((event: GestureEvent) => {
-            this.updateAdjust(event.offsetY);
+            if (!this.localResumePending && !this.screenLocked && this.castController === null) { this.updateAdjust(event.offsetY); }
           })
           .onActionEnd(() => {
-            this.endAdjust();
+            if (!this.screenLocked) { this.endAdjust(); }
           })
       )
     }
@@ -2677,7 +3906,7 @@ export struct PlayerPage {
    * 正是用户反馈的现象。
    */
   private async initPiP(): Promise<void> {
-    if (this.pipController !== null || this.pipCreating || this.pipUnsupported || this.released) {
+    if (this.pipController !== null || this.pipCreating || this.pipUnsupported || this.released || this.castController !== null || this.restoreCast || this.localResumePending) {
       return;
     }
     if (!PiPWindow.isPiPEnabled()) {
@@ -2703,13 +3932,15 @@ export struct PlayerPage {
         contentHeight: this.videoH > 0 ? this.videoH : 1080
       };
       const controller: PiPWindow.PiPController = await PiPWindow.create(config);
-      if (this.released) {
+      if (this.released || this.castController !== null || this.restoreCast || this.localResumePending) {
+        controller.setAutoStartEnabled(false);
         controller.stopPiP().catch(() => {
           // 已释放，停不掉也无所谓
         });
         return;
       }
       this.pipController = controller;
+      this.pipAvailable = true;
       controller.setAutoStartEnabled(true);
       controller.on('stateChange', (state: PiPWindow.PiPState, reason: string) => {
         this.onPiPStateChange(state, reason);
@@ -2722,19 +3953,63 @@ export struct PlayerPage {
       // 不弹窗打扰用户；但要留一条日志，否则排查时完全无从下手
       console.warn('[pip] create failed: ' + JSON.stringify(e));
       this.pipUnsupported = true;
+      this.pipAvailable = false;
       this.pipController = null;
     } finally {
       this.pipCreating = false;
     }
   }
 
+  private async enterPiP(): Promise<void> {
+    const controller = this.pipController;
+    if (controller === null || this.released || this.castController !== null || this.pipActive || this.pipStarting) { return; }
+    this.pipStarting = true;
+    try {
+      await controller.startPiP();
+      if (this.released || this.castController !== null || this.pipController !== controller) { return; }
+      this.pipBrowseLandscape = this.landscape;
+      this.pipBrowsing = true;
+      AppLifecycle.closeInAppPiP = () => { this.closeBrowsingPiP(); };
+      this.dismissPlayerControls();
+      this.saveProgress();
+      this.restoreWindowState();
+      this.restoreBrightness();
+      this.dropScreen();
+      this.navPathStack.clear(false);
+    } catch (e) {
+      console.warn('[pip] manual start failed: ' + JSON.stringify(e));
+      if (!this.released) { this.toast('暂时无法进入画中画，请检查系统画中画设置后重试'); }
+    } finally {
+      this.pipStarting = false;
+    }
+  }
+
+  private restoreBrowsingPiP(): void {
+    if (!this.pipBrowsing) { return; }
+    this.pipBrowsing = false;
+    AppLifecycle.closeInAppPiP = null;
+    this.applyWindowFullScreen(true);
+    this.applyLocalRotation();
+    this.holdScreen();
+  }
+
+  private closeBrowsingPiP(): void {
+    if (!this.pipBrowsing) { return; }
+    this.saveProgress();
+    this.pipBrowsing = false;
+    AppLifecycle.closeInAppPiP = null;
+    this.aboutToDisappear();
+  }
+
   private releasePiP(): void {
     const c = this.pipController;
     this.pipController = null;
+    this.pipAvailable = false;
     this.pipActive = false;
     if (c === null) {
       return;
     }
+    try { c.setAutoStartEnabled(false); } catch (e) {}
     try {
       c.off('stateChange');
     } catch (e) {
@@ -2751,18 +4026,20 @@ export struct PlayerPage {
   }
 
   private onPiPStateChange(state: PiPWindow.PiPState, reason: string): void {
+    if (state === PiPWindow.PiPState.ABOUT_TO_RESTORE) {
+      this.restoreBrowsingPiP();
+      return;
+    }
     if (state === PiPWindow.PiPState.STARTED) {
+      if (this.castController !== null || this.restoreCast || this.localResumePending) { this.releasePiP(); return; }
       this.pipActive = true;
       // 小窗里不该再盖着一层控制条 / 长按浮层
       this.controlsVisible = false;
-      this.clearPressTimer();
-      this.pressSpeed = false;
-      this.seekPreviewing = false;
+      this.endPress(true);
       return;
     }
     if (state === PiPWindow.PiPState.ABOUT_TO_STOP) {
-      this.pressSpeed = false;
-      this.seekPreviewing = false;
+      this.endPress(true);
       // 记住「停小窗之前是不是在播」：系统会在停窗过程中把播放器暂停，
       // 等 STOPPED 再读就已经是 false 了。
       if (!this.pipStopBySelf) {
@@ -2771,6 +4048,11 @@ export struct PlayerPage {
       return;
     }
     if (state === PiPWindow.PiPState.STOPPED) {
+      if (this.pipBrowsing && reason !== 'panelActionRestore') {
+        this.closeBrowsingPiP();
+        return;
+      }
+      if (reason === 'panelActionRestore') { this.restoreBrowsingPiP(); }
       this.pipActive = false;
       const bySelf: boolean = this.pipStopBySelf;
       this.pipStopBySelf = false;
@@ -2835,15 +4117,17 @@ export struct PlayerPage {
    */
   private handleAppBackground(background: boolean): void {
     this.clearBgTimer();
+    SleepTimer.check();
     if (this.released) {
       return;
     }
     if (!background) {
       // 回到前台。此时小窗还挂着，说明用户是点应用图标进来的 ——
       // 他要的是接着全屏看，不是继续缩在角落。主动关掉小窗，画面收回本页。
-      this.restoreFromPiP();
+      if (!this.pipBrowsing) { this.restoreFromPiP(); }
       return;
     }
+    this.endPress(true);
     this.bgTimer = setTimeout(() => {
       this.bgTimer = -1;
       if (this.released || !AppLifecycle.isBackground() || this.pipActive) {
@@ -2902,7 +4186,7 @@ export struct PlayerPage {
    * 播放器重建一遍 —— 比 STOPPED 回调慢一拍，所以不能只试一次。
    */
   private nudgePlay(retries: number): void {
-    if (this.released) {
+    if (this.released || this.castController !== null || this.localResumePending) {
       return;
     }
     this.player.play();
@@ -2927,103 +4211,133 @@ export struct PlayerPage {
     }
   }
 
-  /**
-   * 长按加速 + 长按后左右滑快进/快退。
-   *
-   * 为什么手写 onTouch 而不用 LongPressGesture + PanGesture：
-   * 长按识别成功之后，同一根手指再起 Pan 在 ArkUI 里并不可靠（手势流已被长按吃掉）；
-   * 而 GestureGroup 的 parallel 模式又会让「上下滑调音量/亮度」被误判成横滑。
-   * 自己算时序最稳：按住 380ms 进加速 → 之后横移换算成跳转量 → 抬手才真正 seek。
-   */
+  private clearSeekPreviewTimer(): void {
+    if (this.seekPreviewTimer >= 0) {
+      clearTimeout(this.seekPreviewTimer);
+      this.seekPreviewTimer = -1;
+    }
+  }
+
+  private scheduleSeekPreviewHide(): void {
+    this.clearSeekPreviewTimer();
+    this.seekPreviewTimer = setTimeout(() => {
+      this.seekPreviewTimer = -1;
+      this.seekPreviewVisible = false;
+    }, 900);
+  }
+
+  /** 全屏横滑预览并跳转进度；两侧长按 600 毫秒临时 3 倍速。 */
   private handlePressTouch(event: TouchEvent): void {
+    if (this.castController !== null || this.screenLocked) { return; }
     if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
-      this.endPress();
+      if (this.touchGestureActive) { this.endPress(event.type === TouchType.Cancel); }
+      else {
+        this.clearSeekPreviewTimer();
+        this.seekDragging = false;
+        this.seekPreviewing = false;
+        this.seekPreviewVisible = false;
+      }
+      this.touchGestureActive = false;
       return;
     }
     const touches = event.touches;
-    if (touches.length === 0) {
-      return;
-    }
+    if (touches.length > 1) { this.endPress(true); return; }
+    if (touches.length === 0) { return; }
     const x: number = touches[0].x;
     const y: number = touches[0].y;
     if (event.type === TouchType.Down) {
-      // 控制条可见时不接管：按钮和进度条就压在画面上，抢事件会让它们点不动
-      if (this.controlsVisible || this.errorText !== '') {
-        return;
+      this.touchGestureActive = false;
+      // 每次新触摸先清掉上一手势的预览，避免横滑浮层残留到后续边缘点按。
+      this.clearSeekPreviewTimer();
+      this.seekDragging = false;
+      this.seekPreviewing = false;
+      this.seekPreviewVisible = false;
+      this.seekDeltaMs = 0;
+      this.pressSpeed = false;
+      this.touchAxis = '';
+      if (this.errorText !== '') { return; }
+      this.touchGestureActive = true;
+      if (this.controlsVisible) {
+        if (this.hideTimer >= 0) { clearTimeout(this.hideTimer); this.hideTimer = -1; }
       }
       this.clearPressTimer();
       this.pressDownX = x;
       this.pressDownY = y;
       this.suppressTap = false;
-      this.pressTimer = setTimeout(() => {
-        this.pressTimer = -1;
-        if (this.released) {
-          return;
-        }
-        this.pressSpeed = true;
-        this.seekDragging = false;
-        this.seekPreviewing = false;
-        this.seekBaseMs = this.player.currentTime();
-        this.seekPreviewMs = this.seekBaseMs;
-        this.seekDeltaMs = 0;
-        // 暂停态改速度会被播放器拒绝；恢复播放时会按 speedValue 重新应用
-        if (this.playing) {
-          this.player.setSpeed(PlayerPage.PRESS_SPEED);
-        }
-      }, PlayerPage.PRESS_DELAY_MS);
-      return;
-    }
-    // 剩下的是 Move
-    if (this.pressTimer >= 0) {
-      // 还没到长按时长就动了：让位给上下滑调音量/亮度
-      if (Math.abs(x - this.pressDownX) > 12 || Math.abs(y - this.pressDownY) > 12) {
-        this.clearPressTimer();
+      this.seekDragging = false;
+      this.seekPreviewing = false;
+      const sideWidth = this.canvasW > 0 ? this.canvasW : 640;
+      const sidePress = x < sideWidth / 5 || x > sideWidth * 4 / 5;
+      if (sidePress) {
+        this.pressTimer = setTimeout(() => {
+          this.pressTimer = -1;
+          if (this.released || !this.playing || !this.touchGestureActive || this.screenLocked || this.castController !== null) { return; }
+          this.dismissPlayerControls();
+          this.clearPauseHint();
+          this.pressSpeed = true;
+          this.adjustKind = '';
+          this.clearAdjustTimer();
+          this.player.setSpeed(this.settings.longPressSpeed);
+        }, PlayerPage.PRESS_DELAY_MS);
       }
       return;
     }
-    if (!this.pressSpeed) {
-      return;
+    if (!this.touchGestureActive) { return; }
+    if (this.pressTimer >= 0) {
+      if (Math.abs(x - this.pressDownX) > 12 || Math.abs(y - this.pressDownY) > 12) {
+        this.clearPressTimer();
+      }
+    }
+    if (this.pressSpeed || this.touchAxis === 'vertical') { return; }
+    if (!this.seekDragging) {
+      const dx = x - this.pressDownX;
+      const dy = y - this.pressDownY;
+      if (Math.abs(dy) >= 16 && Math.abs(dy) > Math.abs(dx)) {
+        this.touchAxis = 'vertical';
+        this.clearPressTimer();
+        return;
+      }
+      if (Math.abs(dx) < 16 || Math.abs(dx) < Math.abs(dy)) { return; }
+      this.touchAxis = 'horizontal';
+      this.clearPressTimer();
+      this.seekDragging = true;
+      this.seekBaseMs = this.player.currentTime();
     }
     const dx: number = x - this.pressDownX;
-    if (Math.abs(dx) < 16) {
-      return;
-    }
-    this.seekDragging = true;
     const width: number = this.canvasW > 0 ? this.canvasW : 640;
     let target: number = this.seekBaseMs + (dx / width) * PlayerPage.SEEK_FULL_SPAN_MS;
-    if (target < 0) {
-      target = 0;
-    }
-    if (this.durationMs > 0 && target > this.durationMs) {
-      target = this.durationMs;
-    }
+    if (target < 0) { target = 0; }
+    if (this.durationMs > 0 && target > this.durationMs) { target = this.durationMs; }
     this.seekPreviewMs = target;
     this.seekDeltaMs = target - this.seekBaseMs;
     this.seekPreviewing = true;
+    this.seekPreviewVisible = true;
+    this.scheduleSeekPreviewHide();
   }
 
-  /** 抬手：恢复用户自己选的倍速；发生过横移才真正跳转 */
-  private endPress(): void {
+  /** 抬手时提交预览进度，或恢复长按前的倍速。 */
+  private endPress(cancelled: boolean = false): void {
+    this.touchGestureActive = false;
     this.clearPressTimer();
-    if (!this.pressSpeed) {
-      return;
-    }
-    const target: number = this.seekPreviewMs;
-    const jumped: boolean = this.seekDragging && this.seekPreviewing;
+    this.clearSeekPreviewTimer();
+    const wasSpeeding = this.pressSpeed;
+    const jumped = !cancelled && this.seekDragging && this.seekPreviewing && !wasSpeeding;
+    const target = this.seekPreviewMs;
     this.pressSpeed = false;
     this.seekDragging = false;
     this.seekPreviewing = false;
-    this.suppressTap = jumped;
-    // 恢复到设置里选的倍速（不一定是 1.0）
-    this.player.setSpeed(this.speedValue);
+    this.seekPreviewVisible = false;
+    this.suppressTap = jumped || wasSpeeding;
+    if (wasSpeeding) { this.player.setSpeed(this.speedValue); }
     if (jumped) {
       this.player.seekTo(target);
       this.applySeekUi(target);
     }
+    if (this.controlsVisible) { this.scheduleHideControls(); }
   }
 
   private pressSpeedLabel(): string {
-    return PlayerPage.PRESS_SPEED.toFixed(1) + 'x 加速中';
+    return this.settings.longPressSpeed.toFixed(1) + 'x 加速中';
   }
 
   private seekDeltaText(): string {

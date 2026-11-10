@@ -54,7 +54,8 @@ export class AvPlayerController {
     { label: '1.0x', value: 1.0 },
     { label: '1.25x', value: 1.25 },
     { label: '1.5x', value: 1.5 },
-    { label: '2.0x', value: 2.0 }
+    { label: '2.0x', value: 2.0 },
+    { label: '3.0x', value: 3.0 }
   ];
 
   static speedToEnum(speed: number): media.PlaybackSpeed {
@@ -69,6 +70,8 @@ export class AvPlayerController {
         return media.PlaybackSpeed.SPEED_FORWARD_1_50_X;
       case 2.0:
         return media.PlaybackSpeed.SPEED_FORWARD_2_00_X;
+      case 3.0:
+        return media.PlaybackSpeed.SPEED_FORWARD_3_00_X;
       default:
         return media.PlaybackSpeed.SPEED_FORWARD_1_00_X;
     }

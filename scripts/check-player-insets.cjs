@@ -1,0 +1,16 @@
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
+const ts=require('./test-typescript.cjs');
+const s=fs.readFileSync('entry/src/main/ets/pages/PlayerPage.ets','utf8');
+const callback=s.slice(s.indexOf('  private insetsChanged:'),s.indexOf('  @State topPadVp:'));
+const methods=s.slice(s.indexOf('  private watchPlayerInsets('),s.indexOf('  /**',s.indexOf('  private syncTopPad(')));
+let measured=0,registered=0,removed=0,notify;
+const win={on:(type,fn)=>{assert.equal(type,'avoidAreaChange');registered++;notify=fn},off:(type,fn)=>{assert.equal(fn,notify);removed++}};
+const P=vm.runInNewContext(ts.transpile('class P{'+callback+methods+'}',{target:ts.ScriptTarget.ES2020})+'\nP',{console,window:{AvoidAreaType:{TYPE_SYSTEM:0}},SystemInsets:{measureTopVp:w=>{assert.equal(w,win);return measured}},DevicePolicy:{currentWindow:()=>{throw Error('must use player window')}}});
+const p=new P();p.win=win;p.released=false;p.landscape=true;p.insetsWindow=null;p.watchPlayerInsets(win);assert.equal(p.topPadVp,8);
+measured=38;notify({type:0});assert.equal(p.topPadVp,46);
+p.watchPlayerInsets(win);assert.equal(registered,1);
+measured=0;notify({type:0});assert.equal(p.topPadVp,8);
+p.landscape=false;notify({type:0});assert.equal(p.topPadVp,48);
+p.unwatchPlayerInsets();assert.equal(removed,1);
+p.released=true;measured=60;notify({type:0});assert.equal(p.topPadVp,48);
+console.log('PASS: late status-bar appearance updates player inset; rotation, duplicate binding and cleanup are handled.');

@@ -50,6 +50,14 @@
           ],
           "when": "inuse"
         }
+      },
+      {
+        "name": "ohos.permission.KEEP_BACKGROUND_RUNNING",
+        "reason": "$string:permission_background_reason",
+        "usedScene": {
+          "abilities": ["EntryAbility"],
+          "when": "inuse"
+        }
       }
     ],
     "abilities": [
@@ -64,6 +72,7 @@
         // 大屏/超级桌面适配：显式声明横屏与全屏能力，系统才会把应用当作
         // 「可按大屏渲染」的媒体类应用分配窗口（否则走平行视界的手机比例通道）
         "orientation": "auto_rotation",
+        "backgroundModes": ["audioPlayback"],
         "supportWindowMode": ["fullscreen", "split"],
         "minWindowWidth": 320,
         "minWindowHeight": 320,
